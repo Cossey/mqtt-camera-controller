@@ -60,17 +60,18 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: mqtt-camera-controller:test
           builder: ${{ steps.buildx.outputs.name }}
 
-      - name: Save docker image as artifact
+      - name: Export built image to tar
+        if: always()
+        run: |
+          docker image save mqtt-camera-controller:test -o image.tar
+        # Save the built image to a tar so it can be inspected
+      - name: Upload docker image artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: docker-image-tar
-          path: |
-            ./image.tar
-        # Save the built image to a tar so it can be inspected
-      - name: Export built image to tar
-        run: |
-          docker image save mqtt-camera-controller:test -o image.tar
+          path: ./image.tar
