@@ -1,0 +1,25 @@
+version: "3.8"
+services:
+  mqtt-camera-controller:
+    build: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: "production"
+      # Make sure the container loads the config from this path
+      CONFIG_PATH: /app/config.yaml
+    volumes:
+      # Bind the repo root example or your live config into the container
+      - ./config.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "ffmpeg", "-version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Optional: expose for debugging (not required for MQTT interaction)
+    ports:
+      - "3000:3000"

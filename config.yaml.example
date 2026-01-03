@@ -1,0 +1,90 @@
+# Example configuration for mqtt-camera-controller
+# Copy to config.yaml or set CONFIG_PATH to a custom path.
+
+mqtt:
+  server: "localhost"
+  port: 1883
+  basetopic: "mqttai"
+  client: "mqtt-client"
+  # username: "your-username"
+  # prefer using a Docker secret file with `password_file`:
+  password_file: /run/secrets/mqtt_password
+  # you may set the password directly (not recommended):
+  # password: "your-password"
+  # url: optional if you prefer to set the full URL directly (e.g. mqtt://user:pass@host:1883)
+
+# Cameras can be specified in two supported ways:
+
+# 1) Mapping form: name -> camera object
+cameras:
+  front-door:
+    host: "192.168.1.10"
+    port: 80
+    username: "admin"
+    # prefer Docker secret file (password_file) in production
+    password_file: /run/secrets/frontdoor_password
+    # password: "password"  # not recommended; use password_file in production
+    snapshot:
+      # type: 'url' uses HTTP snapshot; 'stream' uses ffmpeg to capture a frame from a stream
+      type: url
+      # unified snapshot address for either mode (HTTP URL or RTSP/RTMP stream)
+      address: "http://192.168.1.10/snapshot.jpg"
+      enabled: true
+      interval: 0       # seconds; 0 = disabled
+      onEvent: true
+      # snapshot-specific credentials (preferred to use Docker secret files)
+      # username: "user"
+      # password_file: /run/secrets/frontdoor_snapshot_password
+    durations:
+      motion: 10
+      line: 10
+      people: 10
+      vehicle: 10
+      animal: 10
+
+  # 2) Array form (preferred when you want to include a 'name' property with other fields)
+  - name: "driveway"
+    host: "192.168.1.11"
+    username: "admin"
+    # prefer Docker secret file (password_file) in production
+    password_file: /run/secrets/driveway_password
+    # password: "password"  # not recommended; use password_file in production
+    snapshot:
+      type: stream
+      # stream address can be RTSP/RTMP/HTTP depending on camera; ffmpeg must be available in runtime
+      address: "rtsp://user:pass@192.168.1.11:554/stream1"
+      enabled: true
+      interval: 60
+      onEvent: true
+    durations:
+      motion: 5
+      line: 10
+      people: 10
+      vehicle: 10
+      animal: 10
+    # Event mode: 'pull' (default) or 'push'. If 'push' is selected, the camera can POST
+    # notifications to the controller's notify server. You can enable automatic subscription
+    # creation if your camera supports CreateSubscription by setting autoSubscribe: true.
+    event:
+      mode: push
+      push:
+        autoSubscribe: true
+        # optional: custom path on notify server. If omitted the default will be
+        # /onvif/notify/<camera-name>
+        # notifyPath: "/onvif/notify/driveway"
+
+# Optional: configure the notify server used to receive ONVIF push notifications
+notify:
+  # baseUrl is used when requesting the camera to POST events back (must be reachable by camera)
+  # e.g. "https://myhost.example" or "http://192.168.1.5:8080"
+  baseUrl: "http://192.168.1.5:8080"
+  # port to listen on for incoming notifications (default 8080)
+  port: 8080
+  # base path prefix (default /onvif/notify)
+  basePath: "/onvif/notify"
+
+# Optional global settings
+logging:
+  level: "info"  # debug, info, warn, error
+
+# Templates and advanced mappings are possible (future)

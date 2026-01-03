@@ -1,0 +1,36 @@
+{
+  "name": "mqtt-camera-controller",
+  "version": "0.1.0",
+  "description": "ONVIF -> MQTT bridge: listens to camera events and publishes channel states and images",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "lint": "eslint . --ext .ts --max-warnings 0",
+    "test": "jest --runInBand --coverage",
+    "prepare": "npm run build"
+  },
+  "keywords": ["onvif","mqtt","camera","snapshots"],
+  "author": "",
+  "license": "BSD-3-Clause",
+  "dependencies": {
+    "mqtt": "^5.0.0",
+    "debug": "^4.3.4",
+    "dotenv": "^16.0.0",
+    "yaml": "^2.1.1",
+    "fast-xml-parser": "^4.0.12"
+  },
+  "devDependencies": {
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "@types/debug": "^4.1.7",
+    "eslint": "^8.0.0",
+    "@typescript-eslint/parser": "^5.0.0",
+    "@typescript-eslint/eslint-plugin": "^5.0.0",
+    "jest": "^29.0.0",
+    "ts-jest": "^29.0.0",
+    "@types/jest": "^29.0.0"
+  }
+}

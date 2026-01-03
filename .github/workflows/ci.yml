@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20.x]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (TypeScript)
+        run: npm run build
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run tests (with coverage)
+        run: npm test --silent
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build Docker image (test)
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: false
+          tags: mqtt-camera-controller:test
+          builder: ${{ steps.buildx.outputs.name }}
+
+      - name: Save docker image as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-tar
+          path: |
+            ./image.tar
+        # Save the built image to a tar so it can be inspected
+      - name: Export built image to tar
+        run: |
+          docker image save mqtt-camera-controller:test -o image.tar
