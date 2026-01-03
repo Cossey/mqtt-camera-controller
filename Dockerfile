@@ -9,12 +9,12 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates python3 g++ make \
   && rm -rf /var/lib/apt/lists/*
 
-# Copy package manifests and install all deps for building
-COPY package*.json ./
-# Prefer npm ci when package-lock.json is present; fall back to npm install
-RUN npm ci || npm install
+# Copy package manifests and minimal build config, then install deps and run lifecycle scripts
+COPY package*.json tsconfig.json ./
+# Prefer npm ci when package-lock.json is present
+RUN npm ci
 
-# Copy source and build application
+# Copy remaining source and build application
 COPY . .
 RUN npm run build
 
