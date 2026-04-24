@@ -3,16 +3,28 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import { CameraConfig } from '../types';
 import { MQTTWrapper } from '../mqttClient';
+import { logInfo, logError } from '../logger';
 
 const log = debug('camera');
 
 export class Camera {
   cfg: CameraConfig;
   mqtt: MQTTWrapper;
+  private lastEventChannelStatus: 'online' | 'offline' | null = null;
 
   constructor(cfg: CameraConfig, mqtt: MQTTWrapper) {
     this.cfg = cfg;
     this.mqtt = mqtt;
+  }
+
+  async setEventChannelStatus(status: 'online' | 'offline', reason?: string) {
+    if (this.lastEventChannelStatus === status) return;
+    this.lastEventChannelStatus = status;
+    this.mqtt.publish(`${this.cfg.name}/status`, status, { retain: true });
+    if (reason) {
+      logInfo(`[INFO] Camera status camera=${this.cfg.name} status=${status} reason=${reason}`);
+      log('event channel status change', this.cfg.name, status, reason);
+    }
   }
 
   async init() {
@@ -35,15 +47,27 @@ export class Camera {
     if (mode === 'pull') {
       try {
         const { startPullPoint } = await import('../onvif/pullPoint');
-        startPullPoint(this.cfg, async (evt) => {
+        await startPullPoint(this.cfg, async (evt) => {
           try {
             await this.handleEvent(evt);
           } catch (err: unknown) {
             log('handleEvent failed', err);
           }
-        }).catch((err: unknown) => log('PullPoint start error', err));
+        }, {
+          onHealthy: () => {
+            void this.setEventChannelStatus('online', 'pull poll success');
+          },
+          onError: (err: unknown) => {
+            logError(`[ERROR] Pull loop error for camera=${this.cfg.name}`, err);
+            void this.setEventChannelStatus('offline', 'pull poll failure');
+          },
+        });
+        // Do not mark online yet; only mark online after first successful PullMessages response.
       } catch (err) {
+        logError(`[ERROR] PullPoint start error for camera=${this.cfg.name}`, err);
+        await this.setEventChannelStatus('offline', 'pull startup failed');
         log('PullPoint module not available', err);
+        throw err;
       }
     }
 
@@ -51,6 +75,7 @@ export class Camera {
     if (mode === 'push') {
       // we perform auto subscribe in CameraManager where we have access to notify server info
       log('Configured for push-mode events');
+      await this.setEventChannelStatus('online', 'push mode configured');
     }
   }
 
@@ -182,17 +207,17 @@ export class Camera {
 
       if (duration && duration > 0) {
         // behave as pulse: set ON then schedule OFF
-        this.mqtt.publish(topic, 'ON');
-        setTimeout(() => this.mqtt.publish(topic, 'OFF'), duration * 1000);
+        this.mqtt.publish(topic, 'ON', { retain: true });
+        setTimeout(() => this.mqtt.publish(topic, 'OFF', { retain: true }), duration * 1000);
       } else {
         // duration is absent or zero: follow ONVIF's reported state if available
         if (state === true) {
-          this.mqtt.publish(topic, 'ON');
+          this.mqtt.publish(topic, 'ON', { retain: true });
         } else if (state === false) {
-          this.mqtt.publish(topic, 'OFF');
+          this.mqtt.publish(topic, 'OFF', { retain: true });
         } else {
           // no explicit state reported: emit ON (no scheduled OFF)
-          this.mqtt.publish(topic, 'ON');
+          this.mqtt.publish(topic, 'ON', { retain: true });
         }
       }
     }

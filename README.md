@@ -1,59 +1,59 @@
 # mqtt-camera-controller
 
-A small, focused Node + TypeScript service that translates ONVIF camera events into MQTT messages and can capture snapshots on demand, on event, or periodically. The project aims to be easy to configure, secure by default (favoring secret files), and friendly for Docker deployments.
+Small Node + TypeScript service that converts ONVIF camera events into MQTT topics and publishes snapshots.
 
-**Development note:** This repository was vibe-coded using GitHub Raptor Mini (Preview). 
+## Transparency
 
-## At a glance
+This project was created with AI assistance.
 
-- Input: ONVIF camera events (PullPoint polling by default, or optional Push/Notify)
-- Output: MQTT topics for event states and binary snapshot payloads
-- Snapshot modes: HTTP snapshot (URL) or stream frame capture with `ffmpeg`
-- Configuration: YAML (`config.yaml`); see `config.yaml.example` as an editable starting template
+- GitHub Raptor Mini (Preview)
+- ChatGPT-5.3-Codex
+
+## What this service does
+
+- Ingests ONVIF events using PullPoint polling (default) or Push/Notify (optional)
+- Publishes event state topics to MQTT (`ON` / `OFF`)
+- Publishes per-camera and app status topics (retained)
+- Publishes snapshot images on demand, on event, or on a schedule
 
 ## Quick start
 
-1. Copy `config.yaml.example` to `config.yaml` and edit it with your settings (do not leave secrets in the example file).
-
-1. Install and run locally in development:
+1. Copy `config.yaml.example` to `config.yaml`.
+2. Edit camera, MQTT, and credential values.
+3. Run locally:
 
 ```bash
 npm install
 npm run dev
 ```
 
-1. Build for production and run:
+Production run:
 
 ```bash
 npm run build
-node dist/index.js
+npm start
 ```
 
-Docker (recommended):
+Docker run:
 
 ```bash
-# build
 docker build -t mqtt-camera-controller .
-
-# run with config mounted (use Docker secrets for passwords)
 docker run -v $(pwd)/config.yaml:/app/config.yaml:ro -e NODE_ENV=production -e CONFIG_PATH=/app/config.yaml mqtt-camera-controller
 ```
 
-Or use the provided `docker-compose.yml`.
+You can also use `docker-compose.yml`.
 
-## Configuration (concise)
+## Configuration basics
 
-Load order (highest → lowest):
+Runtime config load order (highest to lowest):
 
-1. Path passed to `loadConfig()` (programmatic)
-2. `CONFIG_PATH` env var
+1. Path passed directly to `loadConfig()`
+2. `CONFIG_PATH` environment variable
 3. `./config.yaml`
 
-Note: `config.yaml.example` is not used as a runtime fallback. It is intended only as an editable example for development and tests. Jest uses `NODE_ENV=test` so the loader will fall back to the example during unit tests.
+`config.yaml.example` is for editing/reference only. In tests, `NODE_ENV=test` allows fallback to the example config.
 
 ### MQTT
-
-Key fields:
 
 ```yaml
 mqtt:
@@ -61,27 +61,32 @@ mqtt:
   port: 1883
   basetopic: "mqtt"
   client: "mqtt-client"
-  # prefer Docker secret file for credentials
   password_file: /run/secrets/mqtt_password
 ```
 
-### Camera entries
+- Base topic key is `mqtt.basetopic` (fallback: `mqtt.baseTopic`).
+- Use password files (`password_file`) instead of plaintext passwords where possible.
 
-Two supported formats:
-
-- Mapping form (compact):
+### Logging
 
 ```yaml
-cameras:
-  frontdoor: "http://user:pass@192.168.1.10/snapshot.jpg"
+logging:
+  level: info
 ```
 
-- Expanded form (recommended):
+- Valid levels: `debug`, `info`, `warn`, `error`
+- `LOG_LEVEL` environment variable is also supported
+- If both config and env are set, config level is used
+
+### Camera configuration contract
+
+Use separate ONVIF and snapshot settings:
 
 ```yaml
 cameras:
   frontdoor:
     host: 192.168.1.10
+    port: 80
     username: admin
     password_file: /run/secrets/frontdoor_password
     snapshot:
@@ -89,78 +94,119 @@ cameras:
       address: "http://192.168.1.10/snapshot.jpg"
       onEvent: true
       interval: 60
+    event:
+      mode: pull
     durations:
       motion: 10
 ```
 
-Snapshot credentials
+- ONVIF calls use camera root `host` + `port` (`/onvif/device_service`).
+- Snapshot retrieval uses `snapshot.address` exactly as provided.
+- `snapshot.enabled` is not used by runtime and should be omitted.
 
-- Preferred: `snapshot.password_file` (uses Docker secrets)
-- Alternates: `snapshot.username` and `snapshot.password`, or embedded credentials in `snapshot.address` (e.g. `http://user:pass@host/...`) — explicit snapshot credentials take precedence.
+Snapshot credentials priority:
 
-## Events, detection, and topics
+1. `snapshot.password_file`
+2. `snapshot.username` + `snapshot.password`
+3. Credentials embedded in `snapshot.address`
 
-Canonical event types published by the service:
+## MQTT topics and behavior
 
-- motion — detected by `IsMotion` flags, `Motion` topics (e.g., `RuleEngine/.../Motion`) or `motion` keywords
-- line — detected by `Line`/`LineCross` indications or `line`/`linecross` text
-- people — detected by `person`/`people` indicators
-- vehicle — detected by `vehicle` indicators
-- animal — detected by `pet`/`animal` indicators
+Event topics:
 
-How events are published:
+- `<baseTopic>/<cameraName>/motion`
+- `<baseTopic>/<cameraName>/line`
+- `<baseTopic>/<cameraName>/people`
+- `<baseTopic>/<cameraName>/vehicle`
+- `<baseTopic>/<cameraName>/animal`
 
-- Topic: `<baseTopic>/<cameraName>/<event>`
-- Payload: `ON` for active (and `OFF` when the configured duration expires or when OFF is explicitly reported)
-- Duration: per-camera `durations` map (seconds) controls how long to keep an event ON before publishing OFF. If absent/zero, the service follows the reported ON/OFF state from ONVIF if available.
+Event publishing behavior:
 
-## Push / Notify mode (optional)
+- Payloads are `ON` and `OFF`
+- Event topics are retained
+- On startup, each camera publishes retained `OFF` for all canonical event types
+- Event `durations` (seconds) control ON hold time before OFF publish
 
-Some cameras support ONVIF push notifications. When enabled the controller will start a small HTTP server and optionally attempt a CreateSubscription request on the camera so it will POST events back.
+Status topics:
 
-Config example (camera):
+- Camera status: `<baseTopic>/<cameraName>/status` (retained)
+- App status: `<baseTopic>/status` (retained)
+- App status uses MQTT Last Will (`offline`) on unexpected disconnect
+
+Snapshot topic:
+
+- `<baseTopic>/<cameraName>/image`
+- Payload is binary image data
+- Snapshot publishes are non-retained
+
+## Event mapping rules
+
+Mapping is topic-aware (not broad keyword matching):
+
+- `RuleEngine/MotionRegionDetector/Motion` -> `motion`
+- `RuleEngine/CellMotionDetector/Motion` -> `motion`
+- `RuleEngine/PeopleDetector/People` -> `people`
+- `RuleEngine/LineCrossDetector/LineCross` -> `line`
+- `RuleEngine/TPSmartEventDetector/TPSmartEvent`:
+  - `IsVehicle` -> `vehicle`
+  - `IsPet` -> `animal`
+
+Unknown ONVIF topics and unknown TP-Link sub-events are logged at debug level with extracted parameters.
+
+## Pull and push modes
+
+Pull mode (default):
+
+- Polls camera PullPoint endpoint for events
+- Camera status transitions to `online` only after healthy pull activity
+
+Push mode (optional):
+
+- App hosts a notify endpoint and receives camera POST notifications
+- Optional auto-subscribe can request camera-side CreateSubscription
+
+Example push config:
 
 ```yaml
 cameras:
   driveway:
-    snapshot:
-      address: rtsp://192.168.1.11/stream
+    host: 192.168.1.11
+    port: 80
     event:
       mode: push
       push:
         autoSubscribe: true
-        # notifyPath: /onvif/notify/driveway  # optional custom path
-```
 
-App-level notify config:
-
-```yaml
 notify:
-  baseUrl: "https://my-host.example"  # reachable by camera
+  baseUrl: "https://my-host.example"
   port: 8080
   basePath: "/onvif/notify"
 ```
 
-When `notify` is present, the app listens for POSTs on `${notify.basePath}/${cameraName}` and forwards normalized events into MQTT.
+Notify path format is `${notify.basePath}/${cameraName}`.
 
-## Snapshots
+## Security and auth behavior
 
-- `snapshot.type` may be `url` (HTTP snapshot) or `stream` (use ffmpeg to capture a frame). Use `snapshot.address` for the address in both cases.
-- Triggers: on-demand (`<camera>/command/snapshot`), on-event (if `snapshot.onEvent` true), periodic (`snapshot.interval` > 0)
-- For HTTP snapshots the service will use Basic Auth when `snapshot.username`/`snapshot.password` (or `snapshot.password_file`) are set or when credentials are embedded in the `address`.
-- For stream snapshots `ffmpeg` must be available in the runtime image.
+ONVIF request strategy is secure-first:
 
-## Tests & Development
+- Try WS-Security UsernameToken first when credentials exist
+- Fall back to Basic auth only if needed
+- Warn when falling back to Basic over non-TLS (`http://`)
 
-- Unit tests: `npm test` (Jest). The loader will fall back to `config.yaml.example` during tests via `NODE_ENV=test`.
-- Lint: `npm run lint` (ESLint + TypeScript rules).
+## Troubleshooting
 
-## Troubleshooting & tips
+- `No configuration file found`: verify `CONFIG_PATH` or `./config.yaml`
+- Pull URL/path errors: check logs for attempted ONVIF URL and HTTP status
+- Push path mismatch: logs include received path and expected base path
+- Unknown events: visible at `debug` log level
+- For low-level namespace traces, use `DEBUG=*`
 
-- If you see `No configuration file found`, ensure `CONFIG_PATH` or `config.yaml` exists in the working directory.
-- For subscription discovery issues enable debug logs: `DEBUG=mqtt-camera-controller*`.
-- Use Docker secrets (`password_file`) to avoid storing plaintext credentials in files.
+## Development commands
+
+- Tests: `npm test`
+- Lint: `npm run lint`
+- Build: `npm run build`
 
 ## License
 
-BSD 3-Clause — see `LICENSE` for details.
+BSD 3-Clause. See `LICENSE`.

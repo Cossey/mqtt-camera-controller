@@ -4,6 +4,7 @@ import http from 'http';
 import { CameraConfig, AppConfig } from '../types';
 import { CameraManager } from '../cameras/cameraManager';
 import { findEventTypesInObj } from './pullPoint';
+import { logError, logInfo } from '../logger';
 
 const log = debug('push');
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@', allowBooleanAttributes: true });
@@ -19,6 +20,7 @@ export function parseNotificationXml(xml: string) {
     const obj = parser.parse(xml);
     return findEventTypesInObj(obj);
   } catch (err) {
+    logError('[ERROR] Failed to parse ONVIF notify payload', err);
     log('parse error', err);
     return [] as { type: string; state?: boolean | null }[];
   }
@@ -29,7 +31,6 @@ export function startPushServer(cfg: AppConfig, manager: CameraManager) {
   const basePath = (cfg.notify && cfg.notify.basePath) || '/onvif/notify';
 
   const srv = http.createServer(async (req, res) => {
-    console.log('notify request', req && req.url, 'method', req && req.method);
     if (!req.url || req.method !== 'POST') {
       res.statusCode = 404;
       res.end('Not Found');
@@ -38,6 +39,7 @@ export function startPushServer(cfg: AppConfig, manager: CameraManager) {
 
     // only accept POSTs under basePath
     if (!req.url.startsWith(basePath)) {
+      logError(`[ERROR] Rejected ONVIF notify path receivedPath=${req.url} expectedPrefix=${basePath}`);
       res.statusCode = 404;
       res.end('Not Found');
       return;
@@ -71,6 +73,7 @@ export function startPushServer(cfg: AppConfig, manager: CameraManager) {
     });
   });
 
+  logInfo(`[INFO] Push notify server listening port=${port} basePath=${basePath}`);
   srv.listen(port, () => log(`notify server listening on ${port} ${basePath}`));
 
   return srv;

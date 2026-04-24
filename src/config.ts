@@ -1,7 +1,23 @@
 import fs from 'fs';
 import path from 'path';
 import YAML from 'yaml';
-import { AppConfig, CameraConfig, RawCameraEntry, MqttConfig, SnapshotConfig } from './types';
+import { AppConfig, CameraConfig, RawCameraEntry, MqttConfig, SnapshotConfig, LogLevelName } from './types';
+
+function validateCameraOnvifConnectivity(cameras: CameraConfig[]) {
+  for (const cam of cameras) {
+    const mode = cam.event?.mode || 'pull';
+    const requiresConnection = mode === 'pull' || (mode === 'push' && Boolean(cam.event?.push?.autoSubscribe));
+    if (!requiresConnection) continue;
+
+    if (!cam.host || typeof cam.host !== 'string' || cam.host.trim().length === 0) {
+      throw new Error(`Camera '${cam.name}' requires 'host' for ONVIF ${mode} mode`);
+    }
+
+    if (typeof cam.port !== 'number' || !Number.isFinite(cam.port) || cam.port <= 0) {
+      throw new Error(`Camera '${cam.name}' requires a valid numeric 'port' for ONVIF ${mode} mode`);
+    }
+  }
+}
 
 function normalizeMqtt(raw: unknown): MqttConfig {
   const mqtt: MqttConfig = {};
@@ -19,8 +35,8 @@ function normalizeMqtt(raw: unknown): MqttConfig {
     try {
       const txt = fs.readFileSync(mqtt.password_file, 'utf8');
       mqtt.password = txt.trim();
-    } catch (_err) {
-      // ignore, will log later if missing
+    } catch (err) {
+      console.error(`[ERROR] Failed to read mqtt.password_file path=${mqtt.password_file}`, err);
     }
   }
   return mqtt;
@@ -73,8 +89,8 @@ function normalizeCamera(name: string, entry: RawCameraEntry): CameraConfig {
     try {
       const txt = fs.readFileSync(pwFile, 'utf8');
       cfg.password = txt.trim();
-    } catch (_err) {
-      // ignore, will log later
+    } catch (err) {
+      console.error(`[ERROR] Failed to read camera password_file camera=${name} path=${pwFile}`, err);
     }
   }
 
@@ -83,8 +99,8 @@ function normalizeCamera(name: string, entry: RawCameraEntry): CameraConfig {
     try {
       const txt = fs.readFileSync(cfg.snapshot.password_file as string, 'utf8');
       cfg.snapshot.password = txt.trim();
-    } catch (_err) {
-      // ignore
+    } catch (err) {
+      console.error(`[ERROR] Failed to read snapshot.password_file camera=${name} path=${cfg.snapshot.password_file}`, err);
     }
   }
 
@@ -131,6 +147,16 @@ export function loadConfig(configPath?: string): AppConfig {
     };
   }
 
+  // optional logging config
+  const loggingRaw = raw.logging || raw.log || undefined;
+  let loggingCfg: AppConfig['logging'] = undefined;
+  if (loggingRaw && typeof loggingRaw === 'object') {
+    const level = String((loggingRaw as Record<string, unknown>).level || '').toLowerCase();
+    if (level === 'debug' || level === 'info' || level === 'warn' || level === 'error') {
+      loggingCfg = { level: level as LogLevelName };
+    }
+  }
+
   // cameras may be an object mapping names -> entry or an array
   if (Array.isArray(camerasRaw)) {
     for (const ent of camerasRaw) {
@@ -144,10 +170,10 @@ export function loadConfig(configPath?: string): AppConfig {
         // support event.mode and push options
         if (entObj.event && typeof entObj.event === 'object') {
           const ev = entObj.event as any;
-        cam.event = {
-          mode: (ev.mode as 'pull' | 'push') || undefined,
-          push: (ev.push as any) || undefined,
-        };
+          cam.event = {
+            mode: (ev.mode as 'pull' | 'push') || undefined,
+            push: (ev.push as any) || undefined,
+          };
         }
         cameras.push(cam);
       }
@@ -167,6 +193,8 @@ export function loadConfig(configPath?: string): AppConfig {
     }
   }
 
-  const cfg: AppConfig = { mqtt, cameras, notify: notifyCfg };
+  validateCameraOnvifConnectivity(cameras);
+
+  const cfg: AppConfig = { mqtt, cameras, notify: notifyCfg, logging: loggingCfg };
   return cfg;
 }

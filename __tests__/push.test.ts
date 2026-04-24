@@ -17,11 +17,30 @@ const sampleNotify = `<?xml version="1.0"?>
   </s:Body>
 </s:Envelope>`;
 
+const tplinkVehicleNotify = `<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+  <s:Body>
+    <tev:Notify xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+      <tev:Topic>tns1:RuleEngine/TPSmartEventDetector/TPSmartEvent</tev:Topic>
+      <tev:Message>
+        <tt:Data xmlns:tt="http://www.onvif.org/ver10/schema">
+          <tt:SimpleItem Name="IsVehicle" Value="true" />
+        </tt:Data>
+      </tev:Message>
+    </tev:Notify>
+  </s:Body>
+</s:Envelope>`;
+
 describe('ONVIF push notify parsing & server', () => {
   test('parseNotificationXml extracts motion', () => {
     const evs = parseNotificationXml(sampleNotify);
     expect(evs.length).toBeGreaterThan(0);
     expect(evs.find((e) => e.type === 'motion')).toBeTruthy();
+  });
+
+  test('parseNotificationXml maps TPLink smart IsVehicle to vehicle', () => {
+    const evs = parseNotificationXml(tplinkVehicleNotify);
+    expect(evs.find((e) => e.type === 'vehicle' && e.state === true)).toBeTruthy();
   });
 
   test('startPushServer accepts POST and routes by path', (done) => {

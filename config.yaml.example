@@ -29,7 +29,6 @@ cameras:
       type: url
       # unified snapshot address for either mode (HTTP URL or RTSP/RTMP stream)
       address: "http://192.168.1.10/snapshot.jpg"
-      enabled: true
       interval: 0       # seconds; 0 = disabled
       onEvent: true
       # snapshot-specific credentials (preferred to use Docker secret files)
@@ -53,7 +52,6 @@ cameras:
       type: stream
       # stream address can be RTSP/RTMP/HTTP depending on camera; ffmpeg must be available in runtime
       address: "rtsp://user:pass@192.168.1.11:554/stream1"
-      enabled: true
       interval: 60
       onEvent: true
     durations:

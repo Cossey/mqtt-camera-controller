@@ -2,8 +2,10 @@ import debug from 'debug';
 import { Camera } from './camera';
 import { AppConfig } from '../types';
 import { MQTTWrapper } from '../mqttClient';
+import { logInfo, logError } from '../logger';
 
 const log = debug('camera-manager');
+const EVENT_BASELINE_TOPICS = ['motion', 'line', 'people', 'vehicle', 'animal'] as const;
 
 export class CameraManager {
   cameras: Camera[] = [];
@@ -18,12 +20,23 @@ export class CameraManager {
   async init() {
     for (const camCfg of this.cfg.cameras) {
       const cam = new Camera(camCfg, this.mqtt);
+
+      // Initialize retained baseline event and status state so dashboards have deterministic startup values.
+      for (const topic of EVENT_BASELINE_TOPICS) {
+        this.mqtt.publish(`${camCfg.name}/${topic}`, 'OFF', { retain: true });
+      }
+      this.mqtt.publish(`${camCfg.name}/status`, 'offline', { retain: true });
+
       try {
         await cam.init();
         this.cameras.push(cam);
+        logInfo(`[INFO] Camera initialized camera=${camCfg.name}`);
         log('Camera initialized', camCfg.name);
       } catch (err) {
+        await cam.setEventChannelStatus('offline', 'camera init failed');
+        logError(`[ERROR] Camera init failed name=${camCfg.name}`, err);
         log('Failed to init camera', camCfg.name, err);
+        continue;
       }
 
       // if push mode and autoSubscribe configured, try to ask camera to POST to our notify endpoint
@@ -36,13 +49,24 @@ export class CameraManager {
             const path = camCfg.event?.push?.notifyPath || `${this.cfg.notify.basePath || '/onvif/notify'}/${encodeURIComponent(camCfg.name)}`;
             const notifyUrl = `${this.cfg.notify.baseUrl}${path}`;
             const ok = await createPushSubscription(eventsXaddr, camCfg, notifyUrl);
-            if (ok) log('Push subscription created for', camCfg.name);
-            else log('Push subscription attempt failed for', camCfg.name);
+            if (ok) {
+              await cam.setEventChannelStatus('online', 'push auto-subscribe ok');
+              logInfo(`[INFO] Push subscription created camera=${camCfg.name} notifyUrl=${notifyUrl}`);
+              log('Push subscription created for', camCfg.name);
+            } else {
+              await cam.setEventChannelStatus('offline', 'push auto-subscribe failed');
+              logError(`[ERROR] Push subscription attempt failed for camera=${camCfg.name}`);
+              log('Push subscription attempt failed for', camCfg.name);
+            }
           } else {
+            await cam.setEventChannelStatus('offline', 'events xaddr discovery failed for push auto-subscribe');
+            logError(`[ERROR] Could not determine events XAddr for push subscription camera=${camCfg.name}`);
             log('Could not determine events XAddr for push subscription', camCfg.name);
           }
         }
       } catch (err) {
+        await cam.setEventChannelStatus('offline', 'push auto-subscribe error');
+        logError(`[ERROR] Push auto-subscribe error camera=${camCfg.name}`, err);
         log('autoSubscribe push error', err);
       }
 

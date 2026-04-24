@@ -65,6 +65,8 @@ export interface CameraConfig {
   };
 }
 
+export type LogLevelName = 'debug' | 'info' | 'warn' | 'error';
+
 export interface AppConfig {
   mqtt: MqttConfig;
   cameras: CameraConfig[];
@@ -77,15 +79,13 @@ export interface AppConfig {
     // base path prefix for notifications (default: /onvif/notify)
     basePath?: string;
   };
+  logging?: {
+    level?: LogLevelName;
+  };
 }
 
 export interface EventNotification {
   type: string;
   // true = ON, false = OFF, undefined = not specified (pulse)
   state?: boolean | null;
-}  
-
-export interface AppConfig {
-  mqtt: MqttConfig;
-  cameras: CameraConfig[];
 }

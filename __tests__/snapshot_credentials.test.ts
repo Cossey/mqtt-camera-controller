@@ -13,7 +13,7 @@ function writeTempYaml(content: string) {
 describe('Snapshot credentials and address normalization', () => {
   test('loads snapshot.address and snapshot.password_file', () => {
     const pwFile = writeTempYaml('snapsecret');
-    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  - name: vpncam\n    host: 192.168.1.20\n    snapshot:\n      type: url\n      address: http://192.168.1.20/snap.jpg\n      password_file: ${pwFile}\n`;
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  - name: vpncam\n    host: 192.168.1.20\n    port: 80\n    snapshot:\n      type: url\n      address: http://192.168.1.20/snap.jpg\n      password_file: ${pwFile}\n`;
     const p = writeTempYaml(yaml);
     const cfg = loadConfig(p);
     const cam = cfg.cameras.find(c => c.name === 'vpncam');
@@ -23,7 +23,7 @@ describe('Snapshot credentials and address normalization', () => {
   });
 
   test('embedded credentials in address are parsed and used when snapshot creds not provided', () => {
-    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  - name: authcam\n    snapshot:\n      address: http://user:pass@192.168.1.30/snap.jpg\n`;
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  - name: authcam\n    host: 192.168.1.30\n    port: 80\n    snapshot:\n      address: http://user:pass@192.168.1.30/snap.jpg\n`;
     const p = writeTempYaml(yaml);
     const cfg = loadConfig(p);
     const cam = cfg.cameras.find(c => c.name === 'authcam');

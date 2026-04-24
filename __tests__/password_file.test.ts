@@ -25,7 +25,7 @@ describe('password_file handling', () => {
     const pwFile = path.join(os.tmpdir(), 'cam_pw_test');
     fs.writeFileSync(pwFile, 'camsecret\n');
 
-    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    password_file: ${pwFile}\n`;
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n    password_file: ${pwFile}\n`;
     const p = writeTempYaml(yaml);
     const cfg = loadConfig(p);
     const cam = cfg.cameras.find(c => c.name === 'front-door');
