@@ -107,14 +107,16 @@ cameras:
   - `auto` (default): try camera-reported endpoint first, then fallback to configured host/port
   - `camera`: always use camera-reported endpoint
   - `configured`: always force configured host/port
-- Snapshot retrieval uses `snapshot.address` exactly as provided.
+- Snapshot retrieval uses `snapshot.address` as the source endpoint.
 - `snapshot.enabled` is not used by runtime and should be omitted.
 
-Snapshot credentials priority:
+Snapshot credentials priority (applies to both `snapshot.type: url` and `snapshot.type: stream`):
 
 1. `snapshot.password_file`
 2. `snapshot.username` + `snapshot.password`
 3. Credentials embedded in `snapshot.address`
+
+For stream snapshots, resolved credentials are injected into the ffmpeg input URL and encoded safely for reserved characters.
 
 ## MQTT topics and behavior
 
@@ -190,6 +192,13 @@ notify:
   port: 8080
   basePath: "/onvif/notify"
 ```
+
+Notify URL/port reconciliation behavior:
+
+- If `notify.baseUrl` includes a port and `notify.port` is omitted, the app listens on the `baseUrl` port.
+- If `notify.baseUrl` omits a port and `notify.port` is set, the app appends `notify.port` to the callback URL used for subscription.
+- If both are set and differ, the app keeps split behavior (callback uses `baseUrl` port, listener uses `notify.port`) and logs a warning.
+- If neither provides a port, default is `8080`.
 
 Notify path format is `${notify.basePath}/${cameraName}`.
 

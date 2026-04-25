@@ -4,10 +4,68 @@ import http from 'http';
 import { CameraConfig, AppConfig } from '../types';
 import { CameraManager } from '../cameras/cameraManager';
 import { findEventTypesInObj } from './pullPoint';
-import { logError, logInfo } from '../logger';
+import { logError, logInfo, logWarn } from '../logger';
 
 const log = debug('push');
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@', allowBooleanAttributes: true });
+
+export interface ResolvedNotifyConfig {
+  listenPort: number;
+  basePath: string;
+  callbackBaseUrl?: string;
+  portMismatch: boolean;
+}
+
+function normalizeBasePath(basePath?: string): string {
+  const p = (basePath || '/onvif/notify').trim();
+  if (!p) return '/onvif/notify';
+  return p.startsWith('/') ? p : `/${p}`;
+}
+
+export function resolveNotifyConfig(cfg: AppConfig): ResolvedNotifyConfig {
+  const basePath = normalizeBasePath(cfg.notify?.basePath);
+  const configuredPort = cfg.notify?.port;
+  const rawBaseUrl = cfg.notify?.baseUrl?.trim();
+
+  let parsed: URL | null = null;
+  if (rawBaseUrl) {
+    try {
+      parsed = new URL(rawBaseUrl);
+    } catch {
+      parsed = null;
+    }
+  }
+
+  const baseUrlPort = parsed?.port ? Number(parsed.port) : undefined;
+  const listenPort = typeof configuredPort === 'number' && configuredPort > 0
+    ? configuredPort
+    : (baseUrlPort || 8080);
+
+  let callbackBaseUrl: string | undefined;
+  let portMismatch = false;
+
+  if (parsed) {
+    if (parsed.port) {
+      if (typeof configuredPort === 'number' && configuredPort > 0 && configuredPort !== Number(parsed.port)) {
+        portMismatch = true;
+      }
+    } else {
+      parsed.port = String(listenPort);
+    }
+    callbackBaseUrl = parsed.toString().replace(/\/$/, '');
+  }
+
+  return { listenPort, basePath, callbackBaseUrl, portMismatch };
+}
+
+export function buildNotifyUrl(cfg: AppConfig, cameraName: string, notifyPath?: string): string | null {
+  const resolved = resolveNotifyConfig(cfg);
+  if (!resolved.callbackBaseUrl) return null;
+
+  const path = notifyPath || `${resolved.basePath}/${encodeURIComponent(cameraName)}`;
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return `${resolved.callbackBaseUrl}${normalizedPath}`;
+}
 
 function basicAuthHeader(cfg: CameraConfig) {
   if (!cfg.username) return undefined;
@@ -27,8 +85,13 @@ export function parseNotificationXml(xml: string) {
 }
 
 export function startPushServer(cfg: AppConfig, manager: CameraManager) {
-  const port = (cfg.notify && cfg.notify.port) || 8080;
-  const basePath = (cfg.notify && cfg.notify.basePath) || '/onvif/notify';
+  const resolved = resolveNotifyConfig(cfg);
+  const port = resolved.listenPort;
+  const basePath = resolved.basePath;
+
+  if (resolved.portMismatch) {
+    logWarn(`[WARN] notify.baseUrl port and notify.port differ; callback and listener ports are split callbackBaseUrl=${resolved.callbackBaseUrl} listenPort=${port}`);
+  }
 
   const srv = http.createServer(async (req, res) => {
     if (!req.url || req.method !== 'POST') {

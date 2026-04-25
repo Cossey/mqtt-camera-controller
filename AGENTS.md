@@ -31,6 +31,10 @@ Always run both after code changes when feasible.
   - `cameras.<name>.snapshot.address`
 - Pull mode requires valid camera host/port.
 - Push mode auto-subscribe also requires valid ONVIF host/port.
+- Push notify URL/port reconciliation:
+  - If `notify.baseUrl` includes a port and `notify.port` is omitted, listener uses baseUrl port.
+  - If `notify.baseUrl` omits a port, callback URL uses `notify.port` (or default `8080`).
+  - If both are set and differ, callback uses baseUrl port, listener uses `notify.port`, and runtime warns.
 - Pull endpoint source policy is configurable via `cameras.<name>.event.pull.endpointSelection`:
   - `auto` (default): camera endpoint first, fallback to configured host/port
   - `camera`: always use camera-reported endpoint

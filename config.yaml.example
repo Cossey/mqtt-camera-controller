@@ -60,6 +60,10 @@ cameras:
       type: stream
       # stream address can be RTSP/RTMP/HTTP depending on camera; ffmpeg must be available in runtime
       address: "rtsp://user:pass@192.168.1.11:554/stream1"
+      # optional snapshot credentials also work for stream mode.
+      # if provided, they override embedded credentials in address.
+      # username: "user"
+      # password_file: /run/secrets/driveway_stream_snapshot_password
       interval: 60
       onEvent: true
     durations:
@@ -83,6 +87,8 @@ cameras:
 notify:
   # baseUrl is used when requesting the camera to POST events back (must be reachable by camera)
   # e.g. "https://myhost.example" or "http://192.168.1.5:8080"
+  # If baseUrl has no port, notify.port will be appended to callback URLs.
+  # If baseUrl includes a port and notify.port differs, callback/listener ports are split by design.
   baseUrl: "http://192.168.1.5:8080"
   # port to listen on for incoming notifications (default 8080)
   port: 8080

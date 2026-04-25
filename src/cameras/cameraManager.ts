@@ -41,13 +41,17 @@ export class CameraManager {
 
       // if push mode and autoSubscribe configured, try to ask camera to POST to our notify endpoint
       try {
-        if (camCfg.event?.mode === 'push' && camCfg.event?.push?.autoSubscribe && this.cfg.notify?.baseUrl) {
+        if (camCfg.event?.mode === 'push' && camCfg.event?.push?.autoSubscribe) {
           const { getEventsXaddr } = await import('../onvif/pullPoint');
-          const { createPushSubscription } = await import('../onvif/push');
+          const { createPushSubscription, buildNotifyUrl } = await import('../onvif/push');
           const eventsXaddr = await getEventsXaddr(camCfg);
           if (eventsXaddr) {
-            const path = camCfg.event?.push?.notifyPath || `${this.cfg.notify.basePath || '/onvif/notify'}/${encodeURIComponent(camCfg.name)}`;
-            const notifyUrl = `${this.cfg.notify.baseUrl}${path}`;
+            const notifyUrl = buildNotifyUrl(this.cfg, camCfg.name, camCfg.event?.push?.notifyPath);
+            if (!notifyUrl) {
+              await cam.setEventChannelStatus('offline', 'notify baseUrl missing/invalid for push auto-subscribe');
+              logError(`[ERROR] Missing or invalid notify.baseUrl for push auto-subscribe camera=${camCfg.name}`);
+              continue;
+            }
             const ok = await createPushSubscription(eventsXaddr, camCfg, notifyUrl);
             if (ok) {
               await cam.setEventChannelStatus('online', 'push auto-subscribe ok');

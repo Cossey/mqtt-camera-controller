@@ -1,5 +1,5 @@
 import http from 'http';
-import { parseNotificationXml, startPushServer } from '../src/onvif/push';
+import { parseNotificationXml, startPushServer, resolveNotifyConfig, buildNotifyUrl } from '../src/onvif/push';
 import { CameraManager } from '../src/cameras/cameraManager';
 import { AppConfig } from '../src/types';
 
@@ -78,5 +78,39 @@ describe('ONVIF push notify parsing & server', () => {
         done(new Error('Server failed to bind'));
       }
     }, 10);
+  });
+
+  test('resolveNotifyConfig uses baseUrl port when notify.port is omitted', () => {
+    const cfg = { notify: { baseUrl: 'http://192.168.69.240:8013' } } as AppConfig;
+    const resolved = resolveNotifyConfig(cfg);
+    expect(resolved.listenPort).toBe(8013);
+    expect(resolved.portMismatch).toBe(false);
+    expect(resolved.callbackBaseUrl).toBe('http://192.168.69.240:8013');
+  });
+
+  test('buildNotifyUrl appends notify.port when baseUrl omits port', () => {
+    const cfg = {
+      notify: {
+        baseUrl: 'http://192.168.69.240',
+        port: 8013,
+      },
+    } as AppConfig;
+
+    const notifyUrl = buildNotifyUrl(cfg, 'frontdoor');
+    expect(notifyUrl).toBe('http://192.168.69.240:8013/onvif/notify/frontdoor');
+  });
+
+  test('resolveNotifyConfig flags port mismatch when baseUrl and notify.port differ', () => {
+    const cfg = {
+      notify: {
+        baseUrl: 'http://192.168.69.240:8013',
+        port: 8080,
+      },
+    } as AppConfig;
+
+    const resolved = resolveNotifyConfig(cfg);
+    expect(resolved.portMismatch).toBe(true);
+    expect(resolved.listenPort).toBe(8080);
+    expect(resolved.callbackBaseUrl).toBe('http://192.168.69.240:8013');
   });
 });

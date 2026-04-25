@@ -12,6 +12,64 @@ export class Camera {
   mqtt: MQTTWrapper;
   private lastEventChannelStatus: 'online' | 'offline' | null = null;
 
+  private normalizeCredential(v?: string): string | undefined {
+    if (typeof v !== 'string') return undefined;
+    const t = v.trim();
+    return t.length > 0 ? t : undefined;
+  }
+
+  private decodeCredential(v?: string): string | undefined {
+    if (!v) return undefined;
+    try {
+      return decodeURIComponent(v);
+    } catch {
+      return v;
+    }
+  }
+
+  private resolveSnapshotCredentials(address: string, snapshot: CameraConfig['snapshot']) {
+    let username = this.normalizeCredential(snapshot?.username);
+    let password = this.normalizeCredential(snapshot?.password);
+
+    if (!password && snapshot?.password_file) {
+      // password_file should have been resolved at config load, but attempt to read here too.
+      try {
+        const txt = fs.readFileSync(snapshot.password_file, 'utf8');
+        password = this.normalizeCredential(txt);
+      } catch (_e) {
+        // ignore
+      }
+    }
+
+    try {
+      const u = new URL(address);
+      if (!username && u.username) username = this.decodeCredential(u.username);
+      if (!password && u.password) password = this.decodeCredential(u.password);
+    } catch (_err) {
+      // ignore URL parse error
+    }
+
+    return { username, password };
+  }
+
+  private buildAuthenticatedStreamUrl(address: string, username?: string, password?: string): string {
+    if (!username || !password) return address;
+    try {
+      const u = new URL(address);
+      // Assigning URL username/password applies percent-encoding for reserved characters.
+      u.username = username;
+      u.password = password;
+      return u.toString();
+    } catch (_err) {
+      return address;
+    }
+  }
+
+  private redactCredentials(text: string): string {
+    if (!text) return text;
+    return text.replace(/([a-z][a-z0-9+.-]*:\/\/)([^@\s/:]+)(?::([^@\s/]*))?@/gi, '$1***:***@');
+  }
+
   constructor(cfg: CameraConfig, mqtt: MQTTWrapper) {
     this.cfg = cfg;
     this.mqtt = mqtt;
@@ -89,13 +147,15 @@ export class Camera {
     if (snapshotType === 'stream') {
       const streamUrl = address;
       if (!streamUrl) throw new Error('No stream address configured for stream snapshot');
+      const { username, password } = this.resolveSnapshotCredentials(streamUrl, snapshot);
+      const inputUrl = this.buildAuthenticatedStreamUrl(streamUrl, username, password);
       // Use ffmpeg to grab a single frame and output to stdout
       return await new Promise<Buffer>((resolve, reject) => {
         const args = [
           '-hide_banner',
           '-loglevel', 'error',
           '-y',
-          '-i', streamUrl,
+          '-i', inputUrl,
           '-frames:v', '1',
           '-f', 'image2',
           '-' // stdout
@@ -107,7 +167,7 @@ export class Camera {
         ff.stderr.on('data', (c: Buffer) => { stderr += c.toString(); });
         ff.on('close', (code: number | null) => {
           if (code === 0 && chunks.length > 0) resolve(Buffer.concat(chunks));
-          else reject(new Error(`ffmpeg failed: code=${code} ${stderr}`));
+          else reject(new Error(`ffmpeg failed: code=${code} ${this.redactCredentials(stderr)}`));
         });
         ff.on('error', (err: Error) => reject(err));
       });
@@ -120,30 +180,7 @@ export class Camera {
       if (!fetcher) throw new Error('Global fetch() is not available in this runtime');
 
       const headers: Record<string, string> = {};
-
-      // resolve credentials: snapshot-specific credentials take precedence, otherwise embedded credentials in URL
-      let username: string | undefined = snapshot?.username || undefined;
-      let password: string | undefined = snapshot?.password || undefined;
-
-      try {
-        const u = new URL(addr);
-        if ((!username || !password) && (u.username || u.password)) {
-          username = u.username || username;
-          password = u.password || password;
-        }
-      } catch (_err) {
-        // ignore URL parse error
-      }
-
-      if (!password && snapshot?.password_file) {
-        // password_file should have been resolved at config load, but attempt to read here too
-        try {
-          const txt = fs.readFileSync(snapshot?.password_file as string, 'utf8');
-          password = txt.trim();
-        } catch (_e) {
-          // ignore
-        }
-      }
+      const { username, password } = this.resolveSnapshotCredentials(addr, snapshot);
 
       if (username && password) {
         const token = Buffer.from(`${username}:${password}`).toString('base64');
