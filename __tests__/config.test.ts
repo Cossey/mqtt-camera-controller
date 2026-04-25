@@ -30,6 +30,14 @@ describe('Config loader normalization', () => {
     expect(cam?.snapshot?.type).toBe('stream');
   });
 
+  test('loads pull endpointSelection mode from camera event config', () => {
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  gate:\n    host: 192.168.1.50\n    port: 2020\n    event:\n      mode: pull\n      pull:\n        endpointSelection: configured\n`;
+    const p = writeTempYaml(yaml);
+    const cfg = loadConfig(p);
+    const cam = cfg.cameras.find(c => c.name === 'gate');
+    expect(cam?.event?.pull?.endpointSelection).toBe('configured');
+  });
+
   test('throws when pull mode camera has no port', () => {
     const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  garage:\n    host: 192.168.1.50\n`;
     const p = writeTempYaml(yaml);

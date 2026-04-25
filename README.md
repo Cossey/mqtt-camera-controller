@@ -96,11 +96,17 @@ cameras:
       interval: 60
     event:
       mode: pull
+      pull:
+        endpointSelection: auto
     durations:
       motion: 10
 ```
 
 - ONVIF calls use camera root `host` + `port` (`/onvif/device_service`).
+- Pull endpoint selection (`event.pull.endpointSelection`) controls event endpoint usage:
+  - `auto` (default): try camera-reported endpoint first, then fallback to configured host/port
+  - `camera`: always use camera-reported endpoint
+  - `configured`: always force configured host/port
 - Snapshot retrieval uses `snapshot.address` exactly as provided.
 - `snapshot.enabled` is not used by runtime and should be omitted.
 
@@ -131,7 +137,8 @@ Status topics:
 
 - Camera status: `<baseTopic>/<cameraName>/status` (retained)
 - App status: `<baseTopic>/status` (retained)
-- App status uses MQTT Last Will (`offline`) on unexpected disconnect
+- Status payloads are `ONLINE` and `OFFLINE`
+- App status uses MQTT Last Will (`OFFLINE`) on unexpected disconnect
 
 Snapshot topic:
 
@@ -158,7 +165,8 @@ Unknown ONVIF topics and unknown TP-Link sub-events are logged at debug level wi
 Pull mode (default):
 
 - Polls camera PullPoint endpoint for events
-- Camera status transitions to `online` only after healthy pull activity
+- Endpoint source policy is controlled by `event.pull.endpointSelection` (`auto` by default)
+- Camera status transitions to `ONLINE` only after healthy pull activity
 
 Push mode (optional):
 

@@ -36,7 +36,7 @@ async function main() {
   const baseTopic = cfg.mqtt.basetopic || cfg.mqtt.baseTopic || 'onvif2mqtt';
   mqttOpts.will = {
     topic: `${baseTopic}/status`,
-    payload: 'offline',
+    payload: 'OFFLINE',
     retain: true,
     qos: 1,
   };
@@ -58,8 +58,8 @@ async function main() {
   }
 
   await camManager.init();
-  mqtt.publish('status', 'online', { retain: true });
-  logInfo('[INFO] Global app status set to online topic=status');
+  mqtt.publish('status', 'ONLINE', { retain: true });
+  logInfo('[INFO] Global app status set to ONLINE topic=status');
 
   log('App initialized');
 
@@ -71,9 +71,9 @@ async function main() {
     log('Shutting down');
     logInfo(`[INFO] ${signal} received, publishing OFFLINE statuses`);
 
-    mqtt.publish('status', 'offline', { retain: true });
+    mqtt.publish('status', 'OFFLINE', { retain: true });
     for (const c of cfg.cameras) {
-      mqtt.publish(`${c.name}/status`, 'offline', { retain: true });
+      mqtt.publish(`${c.name}/status`, 'OFFLINE', { retain: true });
     }
 
     setTimeout(() => process.exit(0), 300);

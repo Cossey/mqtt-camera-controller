@@ -31,6 +31,10 @@ Always run both after code changes when feasible.
   - `cameras.<name>.snapshot.address`
 - Pull mode requires valid camera host/port.
 - Push mode auto-subscribe also requires valid ONVIF host/port.
+- Pull endpoint source policy is configurable via `cameras.<name>.event.pull.endpointSelection`:
+  - `auto` (default): camera endpoint first, fallback to configured host/port
+  - `camera`: always use camera-reported endpoint
+  - `configured`: always use configured host/port
 
 ## MQTT Topic Contracts
 
@@ -43,8 +47,9 @@ Always run both after code changes when feasible.
 ## Status and Retain Behavior
 
 - Startup baseline publishes retained `OFF` for event topics per camera.
-- Camera status starts `offline` and transitions based on event-channel health.
-- Pull mode should only show `online` after healthy polling.
+- Status payloads use uppercase `ONLINE` / `OFFLINE` for both camera and global status topics.
+- Camera status starts `OFFLINE` and transitions based on event-channel health.
+- Pull mode should only show `ONLINE` after healthy polling.
 - Global app status uses MQTT Last Will on `<baseTopic>/status`.
 
 ## ONVIF Event Mapping Rules

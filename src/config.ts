@@ -3,6 +3,13 @@ import path from 'path';
 import YAML from 'yaml';
 import { AppConfig, CameraConfig, RawCameraEntry, MqttConfig, SnapshotConfig, LogLevelName } from './types';
 
+function normalizeEndpointSelection(raw: unknown): 'auto' | 'camera' | 'configured' | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === 'auto' || v === 'camera' || v === 'configured') return v;
+  return undefined;
+}
+
 function validateCameraOnvifConnectivity(cameras: CameraConfig[]) {
   for (const cam of cameras) {
     const mode = cam.event?.mode || 'pull';
@@ -172,6 +179,9 @@ export function loadConfig(configPath?: string): AppConfig {
           const ev = entObj.event as any;
           cam.event = {
             mode: (ev.mode as 'pull' | 'push') || undefined,
+            pull: {
+              endpointSelection: normalizeEndpointSelection(ev.pull?.endpointSelection) || 'auto',
+            },
             push: (ev.push as any) || undefined,
           };
         }
@@ -186,6 +196,9 @@ export function loadConfig(configPath?: string): AppConfig {
         const ev = entObj.event as any;
         cam.event = {
           mode: (ev.mode as 'pull' | 'push') || undefined,
+          pull: {
+            endpointSelection: normalizeEndpointSelection(ev.pull?.endpointSelection) || 'auto',
+          },
           push: (ev.push as any) || undefined,
         };
       }

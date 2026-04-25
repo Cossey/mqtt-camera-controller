@@ -40,6 +40,14 @@ cameras:
       people: 10
       vehicle: 10
       animal: 10
+    event:
+      mode: pull
+      pull:
+        # Endpoint source for PullPoint:
+        # auto (default) -> camera endpoint first, fallback to configured host/port
+        # camera -> always use camera-reported endpoint
+        # configured -> always use configured host/port
+        endpointSelection: auto
 
   # 2) Array form (preferred when you want to include a 'name' property with other fields)
   - name: "driveway"

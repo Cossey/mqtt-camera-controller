@@ -25,7 +25,7 @@ export class CameraManager {
       for (const topic of EVENT_BASELINE_TOPICS) {
         this.mqtt.publish(`${camCfg.name}/${topic}`, 'OFF', { retain: true });
       }
-      this.mqtt.publish(`${camCfg.name}/status`, 'offline', { retain: true });
+      this.mqtt.publish(`${camCfg.name}/status`, 'OFFLINE', { retain: true });
 
       try {
         await cam.init();

@@ -32,6 +32,8 @@ export interface SnapshotConfig {
   password_file?: string;
 }
 
+export type PullEndpointSelection = 'auto' | 'camera' | 'configured';
+
 export type RawCameraEntry = string | {
   host?: string;
   port?: number;
@@ -56,6 +58,13 @@ export interface CameraConfig {
   // event subscription options: mode can be 'pull' (default) or 'push' (notify POSTs)
   event?: {
     mode?: 'pull' | 'push';
+    pull?: {
+      // Endpoint source policy for pull mode:
+      // auto (default): try camera returned endpoint first, then configured host/port fallback
+      // camera: always use camera returned endpoint
+      // configured: always use configured camera host/port
+      endpointSelection?: PullEndpointSelection;
+    };
     push?: {
       // if provided, the camera will be asked to POST events to notifyBaseUrl + notifyPath
       autoSubscribe?: boolean;

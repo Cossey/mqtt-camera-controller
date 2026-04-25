@@ -20,10 +20,11 @@ export class Camera {
   async setEventChannelStatus(status: 'online' | 'offline', reason?: string) {
     if (this.lastEventChannelStatus === status) return;
     this.lastEventChannelStatus = status;
-    this.mqtt.publish(`${this.cfg.name}/status`, status, { retain: true });
+    const mqttStatus = status.toUpperCase();
+    this.mqtt.publish(`${this.cfg.name}/status`, mqttStatus, { retain: true });
     if (reason) {
-      logInfo(`[INFO] Camera status camera=${this.cfg.name} status=${status} reason=${reason}`);
-      log('event channel status change', this.cfg.name, status, reason);
+      logInfo(`[INFO] Camera status camera=${this.cfg.name} status=${mqttStatus} reason=${reason}`);
+      log('event channel status change', this.cfg.name, mqttStatus, reason);
     }
   }
 

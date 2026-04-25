@@ -1,7 +1,7 @@
 import { XMLParser } from 'fast-xml-parser';
 import debug from 'debug';
 import { createHash, randomBytes } from 'crypto';
-import { CameraConfig } from '../types';
+import { CameraConfig, PullEndpointSelection } from '../types';
 import { logDebug, logError, logInfo, logWarn } from '../logger';
 
 const log = debug('pullpoint');
@@ -101,6 +101,83 @@ function buildDeviceServiceUrl(cfg: CameraConfig): string {
   const scheme = host.startsWith('http://') || host.startsWith('https://') ? '' : 'http://';
   const baseHost = `${scheme}${host.replace(/\/$/, '')}`;
   return `${baseHost}:${cfg.port}/onvif/device_service`;
+}
+
+function parseConfiguredEndpoint(cfg: CameraConfig): { protocol: 'http:' | 'https:'; hostname: string; port: string } | null {
+  if (!cfg.host || typeof cfg.port !== 'number') return null;
+
+  try {
+    const raw = String(cfg.host).trim();
+    const withScheme = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `http://${raw}`;
+    const u = new URL(withScheme);
+    const protocol: 'http:' | 'https:' = u.protocol === 'https:' ? 'https:' : 'http:';
+    if (!u.hostname) return null;
+    return { protocol, hostname: u.hostname, port: String(cfg.port) };
+  } catch {
+    return null;
+  }
+}
+
+function pinUrlToConfiguredEndpoint(rawUrl: string, cfg: CameraConfig, context: string, emitWarn = true): string {
+  const configured = parseConfiguredEndpoint(cfg);
+  if (!configured) return rawUrl;
+
+  try {
+    const u = new URL(rawUrl);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return rawUrl;
+
+    const before = u.toString();
+    u.protocol = configured.protocol;
+    u.hostname = configured.hostname;
+    u.port = configured.port;
+    const after = u.toString();
+
+    if (before !== after && emitWarn) {
+      logWarn(`[WARN] Rewriting ${context} to configured camera endpoint camera=${cfg.name} from=${redactUrl(before)} to=${redactUrl(after)}`);
+    }
+
+    return after;
+  } catch {
+    return rawUrl;
+  }
+}
+
+function getPullEndpointSelection(cfg: CameraConfig): PullEndpointSelection {
+  const mode = cfg.event?.pull?.endpointSelection;
+  return mode === 'camera' || mode === 'configured' || mode === 'auto' ? mode : 'auto';
+}
+
+function applyEventsXaddrSelection(rawUrl: string, cfg: CameraConfig): string {
+  const selection = getPullEndpointSelection(cfg);
+  if (selection === 'configured') {
+    return pinUrlToConfiguredEndpoint(rawUrl, cfg, 'Events XAddr');
+  }
+  return rawUrl;
+}
+
+type EndpointCandidate = { url: string; source: 'camera' | 'configured' };
+
+function getSubscriptionEndpointCandidates(eventsXaddr: string, cfg: CameraConfig): EndpointCandidate[] {
+  const selection = getPullEndpointSelection(cfg);
+  const configuredUrl = pinUrlToConfiguredEndpoint(eventsXaddr, cfg, 'Events XAddr', false);
+
+  if (selection === 'camera') {
+    return [{ url: eventsXaddr, source: 'camera' }];
+  }
+
+  if (selection === 'configured') {
+    return [{ url: configuredUrl, source: 'configured' }];
+  }
+
+  // auto: prefer camera-returned endpoint, then fallback to configured endpoint if different
+  if (configuredUrl !== eventsXaddr) {
+    return [
+      { url: eventsXaddr, source: 'camera' },
+      { url: configuredUrl, source: 'configured' },
+    ];
+  }
+
+  return [{ url: eventsXaddr, source: 'camera' }];
 }
 
 function normalizeTopic(topic: string): string {
@@ -396,10 +473,11 @@ export async function getEventsXaddr(cfg: CameraConfig): Promise<string | null> 
       if (wsseResp.ok && !wsseFault) {
         const wsseParsed = parseCandidates(wsseTxt);
         if (wsseParsed.selected) {
+          const selected = applyEventsXaddrSelection(wsseParsed.selected, cfg);
           if (!/event/i.test(wsseParsed.selected)) {
             logDebug(`[DEBUG] Events XAddr fallback selected camera=${cfg.name} xaddr=${redactUrl(wsseParsed.selected)} candidates=${wsseParsed.candidates.map((c) => redactUrl(c)).join(',')}`);
           }
-          return wsseParsed.selected;
+          return selected;
         }
       } else {
         logDebug(`[DEBUG] GetCapabilities WSSE attempt failed camera=${cfg.name} url=${redactUrl(url)} status=${wsseResp.status} fault=${wsseFault || 'n/a'}`);
@@ -424,11 +502,12 @@ export async function getEventsXaddr(cfg: CameraConfig): Promise<string | null> 
 
       const basicParsed = parseCandidates(basicTxt);
       if (basicParsed.selected) {
+        const selected = applyEventsXaddrSelection(basicParsed.selected, cfg);
         if (!/event/i.test(basicParsed.selected)) {
           logDebug(`[DEBUG] Events XAddr fallback selected camera=${cfg.name} xaddr=${redactUrl(basicParsed.selected)} candidates=${basicParsed.candidates.map((c) => redactUrl(c)).join(',')}`);
         }
         logDebug(`[DEBUG] GetCapabilities connected using Basic fallback camera=${cfg.name}`);
-        return basicParsed.selected;
+        return selected;
       }
       return null;
     }
@@ -444,10 +523,11 @@ export async function getEventsXaddr(cfg: CameraConfig): Promise<string | null> 
     }
     const parsed = parseCandidates(txt);
     if (parsed.selected) {
+      const selected = applyEventsXaddrSelection(parsed.selected, cfg);
       if (!/event/i.test(parsed.selected)) {
         logDebug(`[DEBUG] Events XAddr fallback selected camera=${cfg.name} xaddr=${redactUrl(parsed.selected)} candidates=${parsed.candidates.map((c) => redactUrl(c)).join(',')}`);
       }
-      return parsed.selected;
+      return selected;
     }
     return null;
   } catch (err) {
@@ -458,6 +538,8 @@ export async function getEventsXaddr(cfg: CameraConfig): Promise<string | null> 
 }
 
 async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfig): Promise<string | null> {
+  const endpointSelection = getPullEndpointSelection(cfg);
+  const endpointCandidates = getSubscriptionEndpointCandidates(eventsXaddr, cfg);
   const bodyWithTermination = `<tev:CreatePullPointSubscription xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
         <wsnt:InitialTerminationTime>PT1H</wsnt:InitialTerminationTime>
       </tev:CreatePullPointSubscription>`;
@@ -502,63 +584,84 @@ async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfi
         ];
 
     const attemptFailures: string[] = [];
-    let warnedBasicOverHttp = false;
 
-    for (const variant of headerVariants) {
-      for (const req of requestVariants) {
-        if (req.useWsse && (!cfg.username || !cfg.password)) continue;
+    for (const endpoint of endpointCandidates) {
+      const endpointUrl = endpoint.url;
+      let warnedBasicOverHttp = false;
 
-        const headers = { ...variant.headers };
-        if (!req.useWsse && auth) {
-          if (!warnedBasicOverHttp && /^http:\/\//i.test(eventsXaddr)) {
-            warnedBasicOverHttp = true;
-            logWarn(`[WARN] Falling back to Basic auth over non-TLS camera=${cfg.name} url=${redactUrl(eventsXaddr)}`);
+      if (endpointSelection === 'auto' && endpoint.source === 'configured' && endpointCandidates.length > 1) {
+        logWarn(`[WARN] Falling back to configured ONVIF endpoint for pull subscription camera=${cfg.name} url=${redactUrl(endpointUrl)}`);
+      }
+
+      for (const variant of headerVariants) {
+        for (const req of requestVariants) {
+          if (req.useWsse && (!cfg.username || !cfg.password)) continue;
+
+          const headers = { ...variant.headers };
+          if (!req.useWsse && auth) {
+            if (!warnedBasicOverHttp && /^http:\/\//i.test(endpointUrl)) {
+              warnedBasicOverHttp = true;
+              logWarn(`[WARN] Falling back to Basic auth over non-TLS camera=${cfg.name} url=${redactUrl(endpointUrl)}`);
+            }
+            headers.Authorization = auth;
           }
-          headers.Authorization = auth;
-        }
 
-        const body = buildSoapEnvelope(req.bodyInner, cfg, req.useWsse);
-        const init = { method: 'POST', headers, body };
-        const r = await fetcher(eventsXaddr, init as { method?: string; headers?: Record<string,string>; body?: string });
-        const txt = await r.text();
-        const attempt = `${variant.name}/${req.name}`;
+          const body = buildSoapEnvelope(req.bodyInner, cfg, req.useWsse);
+          const init = { method: 'POST', headers, body };
+          const attempt = `${variant.name}/${req.name}`;
 
-        if (!r.ok) {
-          const fault = soapFaultSummary(txt);
-          const msg = `variant=${attempt} status=${r.status} fault=${fault || 'n/a'}`;
-          attemptFailures.push(msg);
-          logDebug(`[DEBUG] CreatePullPointSubscription attempt failed camera=${cfg.name} url=${redactUrl(eventsXaddr)} ${msg}`);
-          continue;
-        }
+          let r: { ok: boolean; status: number; text: () => Promise<string> };
+          try {
+            r = await fetcher(endpointUrl, init as { method?: string; headers?: Record<string,string>; body?: string }) as { ok: boolean; status: number; text: () => Promise<string> };
+          } catch (err) {
+            const msg = `variant=${attempt} fetchError=${(err as Error)?.message || String(err)}`;
+            attemptFailures.push(msg);
+            logDebug(`[DEBUG] CreatePullPointSubscription request error camera=${cfg.name} url=${redactUrl(endpointUrl)} ${msg}`);
+            continue;
+          }
 
-        // Some cameras return SOAP Fault with HTTP 200.
-        const okFault = soapFaultSummary(txt);
-        if (okFault) {
-          const msg = `variant=${attempt} status=${r.status} fault=${okFault}`;
-          attemptFailures.push(msg);
-          logDebug(`[DEBUG] CreatePullPointSubscription SOAP fault (retrying) camera=${cfg.name} url=${redactUrl(eventsXaddr)} ${msg}`);
-          continue;
-        }
+          const txt = await r.text();
 
-        const obj = parser.parse(txt);
-        const addr = extractSubscriptionAddressFromResponse(obj, eventsXaddr);
-        if (addr) {
+          if (!r.ok) {
+            const fault = soapFaultSummary(txt);
+            const msg = `variant=${attempt} status=${r.status} fault=${fault || 'n/a'}`;
+            attemptFailures.push(msg);
+            logDebug(`[DEBUG] CreatePullPointSubscription attempt failed camera=${cfg.name} url=${redactUrl(endpointUrl)} ${msg}`);
+            continue;
+          }
+
+          // Some cameras return SOAP Fault with HTTP 200.
+          const okFault = soapFaultSummary(txt);
+          if (okFault) {
+            const msg = `variant=${attempt} status=${r.status} fault=${okFault}`;
+            attemptFailures.push(msg);
+            logDebug(`[DEBUG] CreatePullPointSubscription SOAP fault (retrying) camera=${cfg.name} url=${redactUrl(endpointUrl)} ${msg}`);
+            continue;
+          }
+
+          const obj = parser.parse(txt);
+          const addr = extractSubscriptionAddressFromResponse(obj, endpointUrl);
+          if (addr) {
+            const finalAddr = endpoint.source === 'configured'
+              ? pinUrlToConfiguredEndpoint(addr, cfg, 'PullPoint subscription address')
+              : addr;
+            if (attemptFailures.length > 0) {
+              logDebug(`[DEBUG] CreatePullPointSubscription connected using fallback camera=${cfg.name} finalVariant=${attempt} priorFailures=${attemptFailures.length}`);
+            }
+            return finalAddr;
+          }
+
+          // Some cameras omit explicit SubscriptionReference Address and expect PullMessages on Events XAddr.
           if (attemptFailures.length > 0) {
-            logDebug(`[DEBUG] CreatePullPointSubscription connected using fallback camera=${cfg.name} finalVariant=${attempt} priorFailures=${attemptFailures.length}`);
+            logDebug(`[DEBUG] CreatePullPointSubscription using events xaddr fallback after prior failures camera=${cfg.name} finalVariant=${attempt} priorFailures=${attemptFailures.length}`);
           }
-          return addr;
+          logDebug(`[DEBUG] CreatePullPointSubscription response missing subscription address camera=${cfg.name} variant=${attempt} using events xaddr fallback=${redactUrl(endpointUrl)} body=${txt.slice(0, 300)}`);
+          return endpointUrl;
         }
-
-        // Some cameras omit explicit SubscriptionReference Address and expect PullMessages on Events XAddr.
-        if (attemptFailures.length > 0) {
-          logDebug(`[DEBUG] CreatePullPointSubscription using events xaddr fallback after prior failures camera=${cfg.name} finalVariant=${attempt} priorFailures=${attemptFailures.length}`);
-        }
-        logDebug(`[DEBUG] CreatePullPointSubscription response missing subscription address camera=${cfg.name} variant=${attempt} using events xaddr fallback=${redactUrl(eventsXaddr)} body=${txt.slice(0, 300)}`);
-        return eventsXaddr;
       }
     }
 
-    logError(`[ERROR] CreatePullPointSubscription exhausted all fallbacks camera=${cfg.name} url=${redactUrl(eventsXaddr)} failureCount=${attemptFailures.length}`);
+    logError(`[ERROR] CreatePullPointSubscription exhausted all fallbacks camera=${cfg.name} urls=${endpointCandidates.map((e) => redactUrl(e.url)).join(',')} failureCount=${attemptFailures.length}`);
 
     return null;
   } catch (err) {
@@ -685,7 +788,7 @@ export function findEventTypesInObj(obj: unknown): RawEvent[] {
 export async function startPullPoint(
   cfg: CameraConfig,
   cb: (event: { type: string; state?: boolean | null }) => void,
-  hooks?: { onError?: (err: unknown) => void; onHealthy?: () => void }
+  hooks?: { onError?: (err: unknown) => void; onHealthy?: () => void; pollIntervalMs?: number }
 ) {
   const eventsXaddr = await getEventsXaddr(cfg);
   if (!eventsXaddr) {
@@ -704,28 +807,39 @@ export async function startPullPoint(
 
   let stopped = false;
   let healthyLogged = false;
+  let channelHealthy = false;
+  const pollIntervalMs = Math.max(50, hooks?.pollIntervalMs ?? 1500);
 
   (async () => {
     while (!stopped) {
       try {
         const xml = await pullMessagesOnce(subscriptionAddr, cfg);
         if (xml) {
+          if (!channelHealthy) {
+            channelHealthy = true;
+            hooks?.onHealthy?.();
+          }
           if (!healthyLogged) {
             healthyLogged = true;
             logInfo(`[INFO] PullPoint polling healthy camera=${cfg.name}`);
           }
-          hooks?.onHealthy?.();
           const obj = parser.parse(xml);
           const evTypes = findEventTypesInObj(obj);
           for (const et of evTypes) {
             cb({ type: et.type, state: et.state });
           }
+        } else if (channelHealthy) {
+          channelHealthy = false;
+          hooks?.onError?.(new Error('PullMessages failed or returned no data'));
         }
       } catch (err) {
-        hooks?.onError?.(err);
+        if (channelHealthy) {
+          channelHealthy = false;
+          hooks?.onError?.(err);
+        }
         log('pull loop error', err);
       }
-      await new Promise((res) => setTimeout(res, 1500));
+      await new Promise((res) => setTimeout(res, pollIntervalMs));
     }
   })();
 

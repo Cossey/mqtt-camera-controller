@@ -1,11 +1,12 @@
 # Multi-stage Dockerfile optimized for production and ffmpeg support
 
 # Builder stage: install build tools, dependencies and compile TypeScript
-FROM node:20-bullseye-slim AS builder
+FROM node:24-bookworm-slim AS builder
 WORKDIR /app
 
 # Install minimal runtime tools (no native build toolchain since current deps are pure JS)
 RUN apt-get update \
+  && apt-get upgrade -y \
   && apt-get install -y --no-install-recommends ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 # If native addons are added later (node-gyp), re-add python3, make, g++ in the builder stage
@@ -22,11 +23,12 @@ COPY . .
 RUN npm run build
 
 # Runtime stage: smaller image, ffmpeg installed for stream snapshots
-FROM node:20-bullseye-slim
+FROM node:24-bookworm-slim
 WORKDIR /app
 
 # Install ffmpeg and minimal runtime deps
 RUN apt-get update \
+  && apt-get upgrade -y \
   && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
