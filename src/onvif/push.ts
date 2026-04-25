@@ -100,9 +100,17 @@ export function startPushServer(cfg: AppConfig, manager: CameraManager) {
       return;
     }
 
+    // Some clients include query strings or absolute-form URLs; normalize to pathname for matching.
+    let requestPath = req.url;
+    try {
+      requestPath = new URL(req.url, 'http://localhost').pathname;
+    } catch {
+      requestPath = req.url.split('?')[0];
+    }
+
     // only accept POSTs under basePath
-    if (!req.url.startsWith(basePath)) {
-      logError(`[ERROR] Rejected ONVIF notify path receivedPath=${req.url} expectedPrefix=${basePath}`);
+    if (!requestPath.startsWith(basePath)) {
+      logError(`[ERROR] Rejected ONVIF notify path receivedPath=${requestPath} expectedPrefix=${basePath}`);
       res.statusCode = 404;
       res.end('Not Found');
       return;
@@ -114,7 +122,7 @@ export function startPushServer(cfg: AppConfig, manager: CameraManager) {
     req.on('end', async () => {
       try {
         const evs = parseNotificationXml(body);
-        const cam = manager.getCameraByNotifyPath(req.url || '');
+        const cam = manager.getCameraByNotifyPath(requestPath);
         if (cam) {
           for (const e of evs) {
             try {
@@ -124,7 +132,7 @@ export function startPushServer(cfg: AppConfig, manager: CameraManager) {
             }
           }
         } else {
-          log('No matching camera for notify path', req.url);
+          log('No matching camera for notify path', requestPath);
         }
         res.statusCode = 200;
         res.end('OK');
@@ -167,10 +175,23 @@ export async function createPushSubscription(eventsXaddr: string, cfg: CameraCon
     const init = { method: 'POST', headers, body };
     const r = await fetcher(eventsXaddr, init as { method?: string; headers?: Record<string,string>; body?: string });
     const txt = await r.text();
-    log('createPushSubscription response', txt.slice(0, 200));
+    const snippet = txt.slice(0, 200);
+    log('createPushSubscription response', snippet);
+
+    if (!r.ok) {
+      logWarn(`[WARN] CreateSubscription failed status=${r.status} body=${snippet}`);
+      return false;
+    }
+
+    if (/<\s*(?:\w+:)?fault\b/i.test(txt)) {
+      logError(`[ERROR] CreateSubscription returned SOAP Fault status=${r.status} body=${snippet}`);
+      return false;
+    }
+
     return true;
   } catch (err) {
     log('createPushSubscription error', err);
+    logError('[ERROR] CreateSubscription request failed', err);
     return false;
   }
 }
