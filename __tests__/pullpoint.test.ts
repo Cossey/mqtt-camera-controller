@@ -24,6 +24,42 @@ const SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS = `<?xml version="1.0" encoding="utf
   </s:Body>
 </s:Envelope>`;
 
+const SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS_AND_TIMING = `<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:wsa="http://www.w3.org/2005/08/addressing">
+  <s:Body>
+    <tev:CreatePullPointSubscriptionResponse>
+      <wsnt:SubscriptionReference>
+        <wsa:Address>http://192.168.50.202:1024/event-1024_1024/sub-1</wsa:Address>
+      </wsnt:SubscriptionReference>
+      <wsnt:CurrentTime>2026-04-26T00:00:00Z</wsnt:CurrentTime>
+      <wsnt:TerminationTime>2026-04-26T00:00:02Z</wsnt:TerminationTime>
+    </tev:CreatePullPointSubscriptionResponse>
+  </s:Body>
+</s:Envelope>`;
+
+const SOAP_RENEW_RESPONSE = `<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
+  <s:Body>
+    <wsnt:RenewResponse>
+      <wsnt:CurrentTime>2026-04-26T00:00:01Z</wsnt:CurrentTime>
+      <wsnt:TerminationTime>2026-04-26T00:00:03Z</wsnt:TerminationTime>
+    </wsnt:RenewResponse>
+  </s:Body>
+</s:Envelope>`;
+
+const SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS_AND_TIMING_SUB2 = `<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:wsa="http://www.w3.org/2005/08/addressing">
+  <s:Body>
+    <tev:CreatePullPointSubscriptionResponse>
+      <wsnt:SubscriptionReference>
+        <wsa:Address>http://192.168.50.202:1024/event-1024_1024/sub-2</wsa:Address>
+      </wsnt:SubscriptionReference>
+      <wsnt:CurrentTime>2026-04-26T00:00:01Z</wsnt:CurrentTime>
+      <wsnt:TerminationTime>2026-04-26T00:00:03Z</wsnt:TerminationTime>
+    </tev:CreatePullPointSubscriptionResponse>
+  </s:Body>
+</s:Envelope>`;
+
 const SOAP_PULL_MESSAGES_OK = `<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
   <s:Body>
@@ -310,6 +346,251 @@ describe('PullPoint event parsing', () => {
       expect(onError).toHaveBeenCalledTimes(1);
     } finally {
       (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
+    }
+  });
+
+  test('renews pull subscription before expiry when termination time is available', async () => {
+    const fetchMock = jest.fn(async (url: string, init?: { body?: string }) => {
+      const body = init?.body || '';
+
+      if (url.endsWith('/onvif/device_service')) {
+        return mockResponse(true, 200, SOAP_CAPABILITIES_WITH_EVENTS_XADDR);
+      }
+
+      if (body.includes('CreatePullPointSubscription')) {
+        return mockResponse(true, 200, SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS_AND_TIMING);
+      }
+
+      if (body.includes('<wsnt:Renew')) {
+        return mockResponse(true, 200, SOAP_RENEW_RESPONSE);
+      }
+
+      if (url.endsWith('/sub-1')) {
+        return mockResponse(true, 200, SOAP_PULL_MESSAGES_OK);
+      }
+
+      return mockResponse(false, 500, 'unexpected url');
+    });
+
+    const originalFetch = (globalThis as unknown as { fetch?: unknown }).fetch;
+    (globalThis as unknown as { fetch?: unknown }).fetch = fetchMock;
+
+    try {
+      const controller = await startPullPoint(
+        {
+          name: 'gate',
+          host: '192.168.50.202',
+          port: 2020,
+        },
+        () => undefined,
+        {
+          pollIntervalMs: 50,
+        }
+      );
+
+      await wait(1200);
+      controller.stop();
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/sub-1'),
+        expect.objectContaining({
+          body: expect.stringContaining('<wsnt:Renew'),
+        })
+      );
+    } finally {
+      (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
+    }
+  });
+
+  test('re-subscribes after repeated pull failures', async () => {
+    let sub1PullCount = 0;
+    let createCount = 0;
+    const fetchMock = jest.fn(async (url: string, init?: { body?: string }) => {
+      const body = init?.body || '';
+
+      if (url.endsWith('/onvif/device_service')) {
+        return mockResponse(true, 200, SOAP_CAPABILITIES_WITH_EVENTS_XADDR);
+      }
+
+      if (body.includes('CreatePullPointSubscription')) {
+        createCount += 1;
+        return mockResponse(
+          true,
+          200,
+          createCount === 1 ? SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS : SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS_AND_TIMING_SUB2
+        );
+      }
+
+      if (url.endsWith('/sub-1')) {
+        sub1PullCount += 1;
+        return sub1PullCount === 1
+          ? mockResponse(true, 200, SOAP_PULL_MESSAGES_OK)
+          : mockResponse(false, 500, 'pull failed');
+      }
+
+      if (url.endsWith('/sub-2')) {
+        return mockResponse(true, 200, SOAP_PULL_MESSAGES_OK);
+      }
+
+      return mockResponse(false, 500, 'unexpected url');
+    });
+
+    const originalFetch = (globalThis as unknown as { fetch?: unknown }).fetch;
+    (globalThis as unknown as { fetch?: unknown }).fetch = fetchMock;
+    const onHealthy = jest.fn();
+    const onError = jest.fn();
+
+    try {
+      const controller = await startPullPoint(
+        {
+          name: 'gate',
+          host: '192.168.50.202',
+          port: 2020,
+        },
+        () => undefined,
+        {
+          onHealthy,
+          onError,
+          pollIntervalMs: 50,
+          requestTimeoutMs: 100,
+        }
+      );
+
+      await wait(700);
+      controller.stop();
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/sub-2'),
+        expect.anything()
+      );
+      expect(onHealthy).toHaveBeenCalledTimes(2);
+      expect(onError).toHaveBeenCalledTimes(1);
+    } finally {
+      (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
+    }
+  });
+
+  test('falls back to full re-subscribe when proactive renew fails', async () => {
+    let createCount = 0;
+    const fetchMock = jest.fn(async (url: string, init?: { body?: string }) => {
+      const body = init?.body || '';
+
+      if (url.endsWith('/onvif/device_service')) {
+        return mockResponse(true, 200, SOAP_CAPABILITIES_WITH_EVENTS_XADDR);
+      }
+
+      if (body.includes('CreatePullPointSubscription')) {
+        createCount += 1;
+        return mockResponse(
+          true,
+          200,
+          createCount === 1 ? SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS_AND_TIMING : SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS_AND_TIMING_SUB2
+        );
+      }
+
+      if (body.includes('<wsnt:Renew')) {
+        return mockResponse(false, 500, 'renew failed');
+      }
+
+      if (url.endsWith('/sub-1') || url.endsWith('/sub-2')) {
+        return mockResponse(true, 200, SOAP_PULL_MESSAGES_OK);
+      }
+
+      return mockResponse(false, 500, 'unexpected url');
+    });
+
+    const originalFetch = (globalThis as unknown as { fetch?: unknown }).fetch;
+    (globalThis as unknown as { fetch?: unknown }).fetch = fetchMock;
+
+    try {
+      const controller = await startPullPoint(
+        {
+          name: 'gate',
+          host: '192.168.50.202',
+          port: 2020,
+        },
+        () => undefined,
+        {
+          pollIntervalMs: 50,
+        }
+      );
+
+      await wait(1400);
+      controller.stop();
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/sub-1'),
+        expect.objectContaining({
+          body: expect.stringContaining('<wsnt:Renew'),
+        })
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/sub-2'),
+        expect.anything()
+      );
+    } finally {
+      (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
+    }
+  });
+
+  test('times out hanging pull request and reports unhealthy', async () => {
+    jest.useFakeTimers();
+
+    const fetchMock = jest.fn(async (url: string, init?: { body?: string; signal?: AbortSignal }) => {
+      const body = init?.body || '';
+
+      if (url.endsWith('/onvif/device_service')) {
+        return mockResponse(true, 200, SOAP_CAPABILITIES_WITH_EVENTS_XADDR);
+      }
+
+      if (body.includes('CreatePullPointSubscription')) {
+        return mockResponse(true, 200, SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS);
+      }
+
+      if (url.endsWith('/sub-1')) {
+        return await new Promise((resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new Error('AbortError')));
+          setTimeout(() => resolve(mockResponse(true, 200, SOAP_PULL_MESSAGES_OK)), 60000);
+        });
+      }
+
+      return mockResponse(false, 500, 'unexpected url');
+    });
+
+    const originalFetch = (globalThis as unknown as { fetch?: unknown }).fetch;
+    (globalThis as unknown as { fetch?: unknown }).fetch = fetchMock;
+    const onError = jest.fn();
+
+    try {
+      const controller = await startPullPoint(
+        {
+          name: 'gate',
+          host: '192.168.50.202',
+          port: 2020,
+        },
+        () => undefined,
+        {
+          onError,
+          pollIntervalMs: 50,
+          requestTimeoutMs: 100,
+        }
+      );
+
+      await jest.advanceTimersByTimeAsync(700);
+      controller.stop();
+
+      expect(onError).toHaveBeenCalledTimes(0);
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/onvif/device_service'),
+        expect.anything()
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/sub-1'),
+        expect.anything()
+      );
+    } finally {
+      (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
+      jest.useRealTimers();
     }
   });
 });

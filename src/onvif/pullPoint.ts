@@ -6,6 +6,12 @@ import { logDebug, logError, logInfo, logWarn } from '../logger';
 
 const log = debug('pullpoint');
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@', allowBooleanAttributes: true });
+const PULL_SUBSCRIPTION_TERMINATION = 'PT24H';
+const PULL_FAILURES_BEFORE_RESUBSCRIBE = 3;
+const PULL_REQUEST_TIMEOUT_MS = 5000;
+const MIN_RENEW_DELAY_MS = 1000;
+const MIN_RESUBSCRIBE_DELAY_MS = 1000;
+const PULL_STALE_GRACE_MS = 2000;
 
 const TOPIC_TO_EVENT: Record<string, 'motion' | 'people' | 'line' | 'tplink'> = {
   'RuleEngine/MotionRegionDetector/Motion': 'motion',
@@ -333,6 +339,59 @@ function extractSubscriptionAddressFromResponse(parsed: unknown, baseUrl: string
   return null;
 }
 
+function extractResponseDateValue(parsed: unknown, responseLocalName: string, fieldLocalName: string): string | null {
+  const responseNodes: unknown[] = [];
+  collectAllByLocalName(parsed, responseLocalName, responseNodes);
+
+  for (const responseNode of responseNodes) {
+    const fieldNodes: unknown[] = [];
+    collectAllByLocalName(responseNode, fieldLocalName, fieldNodes);
+    for (const node of fieldNodes) {
+      const value = textFromUnknown(node);
+      if (value && value.length > 0) return value;
+    }
+  }
+
+  const fallbackNodes: unknown[] = [];
+  collectAllByLocalName(parsed, fieldLocalName, fallbackNodes);
+  for (const node of fallbackNodes) {
+    const value = textFromUnknown(node);
+    if (value && value.length > 0) return value;
+  }
+
+  return null;
+}
+
+function parseIsoDateMs(value: string | null): number | null {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function extractSubscriptionTimingFromResponse(parsed: unknown, responseLocalName: string): { currentTimeMs: number | null; terminationTimeMs: number | null } {
+  return {
+    currentTimeMs: parseIsoDateMs(extractResponseDateValue(parsed, responseLocalName, 'CurrentTime')),
+    terminationTimeMs: parseIsoDateMs(extractResponseDateValue(parsed, responseLocalName, 'TerminationTime')),
+  };
+}
+
+function computeRenewDelayMs(currentTimeMs: number | null, terminationTimeMs: number | null): number | null {
+  if (!terminationTimeMs) return null;
+
+  const baselineMs = currentTimeMs ?? Date.now();
+  const lifetimeMs = terminationTimeMs - baselineMs;
+  if (!Number.isFinite(lifetimeMs) || lifetimeMs <= 0) {
+    return MIN_RENEW_DELAY_MS;
+  }
+
+  const renewBeforeExpiryMs = lifetimeMs - 30000;
+  const targetDelayMs = renewBeforeExpiryMs > MIN_RENEW_DELAY_MS
+    ? Math.min(lifetimeMs * 0.8, renewBeforeExpiryMs)
+    : lifetimeMs * 0.5;
+
+  return Math.max(MIN_RENEW_DELAY_MS, Math.floor(targetDelayMs));
+}
+
 function collectSimpleItems(node: unknown, out: Record<string, unknown>) {
   if (!node) return;
 
@@ -434,7 +493,41 @@ function basicAuthHeader(cfg: CameraConfig) {
   return `Basic ${token}`;
 }
 
-export async function getEventsXaddr(cfg: CameraConfig): Promise<string | null> {
+function staleThresholdMs(pollIntervalMs: number, requestTimeoutMs: number): number {
+  return Math.max(requestTimeoutMs + pollIntervalMs + PULL_STALE_GRACE_MS, pollIntervalMs * 3);
+}
+
+async function fetchWithTimeout(
+  fetcher: typeof fetch,
+  url: string,
+  init: { method?: string; headers?: Record<string,string>; body?: string },
+  timeoutMs: number
+): Promise<{ ok: boolean; status: number; text: () => Promise<string> }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+
+  try {
+    return await fetcher(url, {
+      ...init,
+      signal: controller.signal,
+    } as {
+      method?: string;
+      headers?: Record<string,string>;
+      body?: string;
+      signal: AbortSignal;
+    }) as { ok: boolean; status: number; text: () => Promise<string> };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+type PullPointSubscription = {
+  address: string;
+  currentTimeMs: number | null;
+  terminationTimeMs: number | null;
+};
+
+export async function getEventsXaddr(cfg: CameraConfig, requestTimeoutMs = PULL_REQUEST_TIMEOUT_MS): Promise<string | null> {
   let url = '';
   try {
     url = buildDeviceServiceUrl(cfg);
@@ -466,7 +559,7 @@ export async function getEventsXaddr(cfg: CameraConfig): Promise<string | null> 
       // Security-first: try WS-Security UsernameToken before Basic auth fallback.
       const wsseBody = buildSoapEnvelope(bodyInner, cfg, true);
       const wsseInit = { method: 'POST', headers, body: wsseBody };
-      const wsseResp = await fetcher(url, wsseInit as { method?: string; headers?: Record<string,string>; body?: string });
+      const wsseResp = await fetchWithTimeout(fetcher, url, wsseInit as { method?: string; headers?: Record<string,string>; body?: string }, requestTimeoutMs);
       const wsseTxt = await wsseResp.text();
       const wsseFault = soapFaultSummary(wsseTxt);
 
@@ -491,7 +584,7 @@ export async function getEventsXaddr(cfg: CameraConfig): Promise<string | null> 
       if (auth) basicHeaders.Authorization = auth;
       const basicBody = buildSoapEnvelope(bodyInner, cfg, false);
       const basicInit = { method: 'POST', headers: basicHeaders, body: basicBody };
-      const basicResp = await fetcher(url, basicInit as { method?: string; headers?: Record<string,string>; body?: string });
+      const basicResp = await fetchWithTimeout(fetcher, url, basicInit as { method?: string; headers?: Record<string,string>; body?: string }, requestTimeoutMs);
       const basicTxt = await basicResp.text();
       const basicFault = soapFaultSummary(basicTxt);
 
@@ -514,7 +607,7 @@ export async function getEventsXaddr(cfg: CameraConfig): Promise<string | null> 
 
     const body = buildSoapEnvelope(bodyInner, cfg, false);
     const init = { method: 'POST', headers, body };
-    const r = await fetcher(url, init as { method?: string; headers?: Record<string,string>; body?: string });
+    const r = await fetchWithTimeout(fetcher, url, init as { method?: string; headers?: Record<string,string>; body?: string }, requestTimeoutMs);
     const txt = await r.text();
     const fault = soapFaultSummary(txt);
     if (!r.ok || fault) {
@@ -537,11 +630,11 @@ export async function getEventsXaddr(cfg: CameraConfig): Promise<string | null> 
   }
 }
 
-async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfig): Promise<string | null> {
+async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfig, requestTimeoutMs = PULL_REQUEST_TIMEOUT_MS): Promise<PullPointSubscription | null> {
   const endpointSelection = getPullEndpointSelection(cfg);
   const endpointCandidates = getSubscriptionEndpointCandidates(eventsXaddr, cfg);
   const bodyWithTermination = `<tev:CreatePullPointSubscription xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
-        <wsnt:InitialTerminationTime>PT1H</wsnt:InitialTerminationTime>
+        <wsnt:InitialTerminationTime>${PULL_SUBSCRIPTION_TERMINATION}</wsnt:InitialTerminationTime>
       </tev:CreatePullPointSubscription>`;
   const bodyMinimal = `<tev:CreatePullPointSubscription xmlns:tev="http://www.onvif.org/ver10/events/wsdl" />`;
 
@@ -612,7 +705,7 @@ async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfi
 
           let r: { ok: boolean; status: number; text: () => Promise<string> };
           try {
-            r = await fetcher(endpointUrl, init as { method?: string; headers?: Record<string,string>; body?: string }) as { ok: boolean; status: number; text: () => Promise<string> };
+            r = await fetchWithTimeout(fetcher, endpointUrl, init as { method?: string; headers?: Record<string,string>; body?: string }, requestTimeoutMs);
           } catch (err) {
             const msg = `variant=${attempt} fetchError=${(err as Error)?.message || String(err)}`;
             attemptFailures.push(msg);
@@ -641,6 +734,7 @@ async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfi
 
           const obj = parser.parse(txt);
           const addr = extractSubscriptionAddressFromResponse(obj, endpointUrl);
+          const timing = extractSubscriptionTimingFromResponse(obj, 'CreatePullPointSubscriptionResponse');
           if (addr) {
             const finalAddr = endpoint.source === 'configured'
               ? pinUrlToConfiguredEndpoint(addr, cfg, 'PullPoint subscription address')
@@ -648,7 +742,11 @@ async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfi
             if (attemptFailures.length > 0) {
               logDebug(`[DEBUG] CreatePullPointSubscription connected using fallback camera=${cfg.name} finalVariant=${attempt} priorFailures=${attemptFailures.length}`);
             }
-            return finalAddr;
+            return {
+              address: finalAddr,
+              currentTimeMs: timing.currentTimeMs,
+              terminationTimeMs: timing.terminationTimeMs,
+            };
           }
 
           // Some cameras omit explicit SubscriptionReference Address and expect PullMessages on Events XAddr.
@@ -656,7 +754,11 @@ async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfi
             logDebug(`[DEBUG] CreatePullPointSubscription using events xaddr fallback after prior failures camera=${cfg.name} finalVariant=${attempt} priorFailures=${attemptFailures.length}`);
           }
           logDebug(`[DEBUG] CreatePullPointSubscription response missing subscription address camera=${cfg.name} variant=${attempt} using events xaddr fallback=${redactUrl(endpointUrl)} body=${txt.slice(0, 300)}`);
-          return endpointUrl;
+          return {
+            address: endpointUrl,
+            currentTimeMs: timing.currentTimeMs,
+            terminationTimeMs: timing.terminationTimeMs,
+          };
         }
       }
     }
@@ -671,7 +773,116 @@ async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfi
   }
 }
 
-async function pullMessagesOnce(subAddr: string, cfg: CameraConfig): Promise<string | null> {
+async function renewPullPointSubscription(subAddr: string, cfg: CameraConfig, requestTimeoutMs = PULL_REQUEST_TIMEOUT_MS): Promise<{ currentTimeMs: number | null; terminationTimeMs: number | null } | null> {
+  const bodyInner = `<wsnt:Renew xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
+        <wsnt:TerminationTime>${PULL_SUBSCRIPTION_TERMINATION}</wsnt:TerminationTime>
+      </wsnt:Renew>`;
+  const action = 'http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewRequest';
+  const headerVariants: Array<{ name: string; headers: Record<string, string> }> = [
+    {
+      name: 'soap12-action-content-type',
+      headers: { 'Content-Type': `application/soap+xml; charset=utf-8; action="${action}"` },
+    },
+    {
+      name: 'soap12-soapaction-header',
+      headers: { 'Content-Type': 'application/soap+xml; charset=utf-8', SOAPAction: action },
+    },
+    {
+      name: 'soap11-soapaction-header',
+      headers: { 'Content-Type': 'text/xml; charset=utf-8', SOAPAction: `"${action}"` },
+    },
+    {
+      name: 'soap12-basic',
+      headers: { 'Content-Type': 'application/soap+xml; charset=utf-8' },
+    },
+  ];
+
+  const auth = basicAuthHeader(cfg);
+  const requestVariants = cfg.username && cfg.password
+    ? [
+        { name: 'wsse', useWsse: true },
+        { name: 'basic', useWsse: false },
+      ]
+    : [
+        { name: 'basic', useWsse: false },
+      ];
+
+  try {
+    const fetcher = (globalThis as unknown as { fetch?: typeof fetch }).fetch;
+    if (!fetcher) throw new Error('Global fetch is not available');
+
+    const attemptFailures: string[] = [];
+
+    for (const variant of headerVariants) {
+      for (const req of requestVariants) {
+        if (req.useWsse && (!cfg.username || !cfg.password)) continue;
+
+        const headers = { ...variant.headers };
+        if (!req.useWsse && auth) {
+          if (/^http:\/\//i.test(subAddr)) {
+            logWarn(`[WARN] Falling back to Basic auth over non-TLS camera=${cfg.name} url=${redactUrl(subAddr)}`);
+          }
+          headers.Authorization = auth;
+        }
+
+        const body = buildSoapEnvelope(bodyInner, cfg, req.useWsse);
+        const init = { method: 'POST', headers, body };
+        const attempt = `${variant.name}/${req.name}`;
+
+        let response: { ok: boolean; status: number; text: () => Promise<string> };
+        try {
+          response = await fetchWithTimeout(fetcher, subAddr, init as { method?: string; headers?: Record<string,string>; body?: string }, requestTimeoutMs);
+        } catch (err) {
+          const msg = `variant=${attempt} fetchError=${(err as Error)?.message || String(err)}`;
+          attemptFailures.push(msg);
+          logDebug(`[DEBUG] RenewPullPointSubscription request error camera=${cfg.name} url=${redactUrl(subAddr)} ${msg}`);
+          continue;
+        }
+
+        const txt = await response.text();
+        if (!response.ok) {
+          const fault = soapFaultSummary(txt);
+          const msg = `variant=${attempt} status=${response.status} fault=${fault || 'n/a'}`;
+          attemptFailures.push(msg);
+          logDebug(`[DEBUG] RenewPullPointSubscription attempt failed camera=${cfg.name} url=${redactUrl(subAddr)} ${msg}`);
+          continue;
+        }
+
+        const okFault = soapFaultSummary(txt);
+        if (okFault) {
+          const msg = `variant=${attempt} status=${response.status} fault=${okFault}`;
+          attemptFailures.push(msg);
+          logDebug(`[DEBUG] RenewPullPointSubscription SOAP fault (retrying) camera=${cfg.name} url=${redactUrl(subAddr)} ${msg}`);
+          continue;
+        }
+
+        const obj = parser.parse(txt);
+        const timing = extractSubscriptionTimingFromResponse(obj, 'RenewResponse');
+        if (timing.terminationTimeMs) {
+          if (attemptFailures.length > 0) {
+            logDebug(`[DEBUG] RenewPullPointSubscription connected using fallback camera=${cfg.name} finalVariant=${attempt} priorFailures=${attemptFailures.length}`);
+          }
+          return timing;
+        }
+
+        logDebug(`[DEBUG] RenewPullPointSubscription response missing termination time camera=${cfg.name} variant=${attempt} body=${txt.slice(0, 300)}`);
+        return {
+          currentTimeMs: timing.currentTimeMs,
+          terminationTimeMs: null,
+        };
+      }
+    }
+
+    logWarn(`[WARN] RenewPullPointSubscription exhausted all fallbacks camera=${cfg.name} url=${redactUrl(subAddr)} failureCount=${attemptFailures.length}`);
+    return null;
+  } catch (err) {
+    logWarn(`[WARN] RenewPullPointSubscription request failed camera=${cfg.name} url=${redactUrl(subAddr)}`, err);
+    log('renewPullPointSubscription error', err);
+    return null;
+  }
+}
+
+async function pullMessagesOnce(subAddr: string, cfg: CameraConfig, requestTimeoutMs = PULL_REQUEST_TIMEOUT_MS): Promise<string | null> {
   const bodyInner = `<tev:PullMessages xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
         <tev:Timeout>PT2S</tev:Timeout>
         <tev:MessageLimit>10</tev:MessageLimit>
@@ -688,7 +899,7 @@ async function pullMessagesOnce(subAddr: string, cfg: CameraConfig): Promise<str
     if (hasCreds) {
       const wsseBody = buildSoapEnvelope(bodyInner, cfg, true);
       const wsseInit = { method: 'POST', headers, body: wsseBody };
-      const wsseResp = await fetcher(subAddr, wsseInit as { method?: string; headers?: Record<string,string>; body?: string });
+      const wsseResp = await fetchWithTimeout(fetcher, subAddr, wsseInit as { method?: string; headers?: Record<string,string>; body?: string }, requestTimeoutMs);
       const wsseTxt = await wsseResp.text();
       const wsseFault = soapFaultSummary(wsseTxt);
       if (wsseResp.ok && !wsseFault) return wsseTxt;
@@ -703,7 +914,7 @@ async function pullMessagesOnce(subAddr: string, cfg: CameraConfig): Promise<str
       if (auth) basicHeaders.Authorization = auth;
       const basicBody = buildSoapEnvelope(bodyInner, cfg, false);
       const basicInit = { method: 'POST', headers: basicHeaders, body: basicBody };
-      const basicResp = await fetcher(subAddr, basicInit as { method?: string; headers?: Record<string,string>; body?: string });
+      const basicResp = await fetchWithTimeout(fetcher, subAddr, basicInit as { method?: string; headers?: Record<string,string>; body?: string }, requestTimeoutMs);
       const basicTxt = await basicResp.text();
       const basicFault = soapFaultSummary(basicTxt);
       if (!basicResp.ok || basicFault) {
@@ -716,7 +927,7 @@ async function pullMessagesOnce(subAddr: string, cfg: CameraConfig): Promise<str
 
     const body = buildSoapEnvelope(bodyInner, cfg, false);
     const init = { method: 'POST', headers, body };
-    const r = await fetcher(subAddr, init as { method?: string; headers?: Record<string,string>; body?: string });
+    const r = await fetchWithTimeout(fetcher, subAddr, init as { method?: string; headers?: Record<string,string>; body?: string }, requestTimeoutMs);
     const txt = await r.text();
     const fault = soapFaultSummary(txt);
     if (!r.ok || fault) {
@@ -788,39 +999,146 @@ export function findEventTypesInObj(obj: unknown): RawEvent[] {
 export async function startPullPoint(
   cfg: CameraConfig,
   cb: (event: { type: string; state?: boolean | null }) => void,
-  hooks?: { onError?: (err: unknown) => void; onHealthy?: () => void; pollIntervalMs?: number }
+  hooks?: { onError?: (err: unknown) => void; onHealthy?: () => void; pollIntervalMs?: number; requestTimeoutMs?: number; staleThresholdMs?: number }
 ) {
-  const eventsXaddr = await getEventsXaddr(cfg);
-  if (!eventsXaddr) {
-    log('No Events XAddr found');
-    throw new Error('No Events XAddr found');
-  }
-  log('Events XAddr', eventsXaddr);
-
-  const subscriptionAddr = await createPullPointSubscription(eventsXaddr, cfg);
-  if (!subscriptionAddr) {
-    log('Failed to create PullPoint subscription');
-    throw new Error('Failed to create PullPoint subscription');
-  }
-  logInfo(`[INFO] PullPoint subscription established camera=${cfg.name} subscription=${redactUrl(subscriptionAddr)}`);
-  log('Subscription address', subscriptionAddr);
-
   let stopped = false;
-  let healthyLogged = false;
   let channelHealthy = false;
   const pollIntervalMs = Math.max(50, hooks?.pollIntervalMs ?? 1500);
+  const requestTimeoutMs = Math.max(250, hooks?.requestTimeoutMs ?? PULL_REQUEST_TIMEOUT_MS);
+  const channelStaleThresholdMs = Math.max(500, hooks?.staleThresholdMs ?? staleThresholdMs(pollIntervalMs, requestTimeoutMs));
+  let consecutiveFailures = 0;
+  let lastSuccessfulPollAt = 0;
+  const state: { subscription: PullPointSubscription | null } = { subscription: null };
+  let renewTimer: ReturnType<typeof setTimeout> | null = null;
+  let recoveryPromise: Promise<void> | null = null;
+
+  const clearRenewTimer = () => {
+    if (renewTimer) {
+      clearTimeout(renewTimer);
+      renewTimer = null;
+    }
+  };
+
+  const scheduleRenewal = (currentSubscription: PullPointSubscription) => {
+    clearRenewTimer();
+    const renewDelayMs = computeRenewDelayMs(currentSubscription.currentTimeMs, currentSubscription.terminationTimeMs);
+    if (renewDelayMs == null) {
+      logDebug(`[DEBUG] PullPoint renewal not scheduled camera=${cfg.name} subscription=${redactUrl(currentSubscription.address)} reason=no-termination-time`);
+      return;
+    }
+
+    logDebug(`[DEBUG] PullPoint renewal scheduled camera=${cfg.name} subscription=${redactUrl(currentSubscription.address)} delayMs=${renewDelayMs}`);
+    renewTimer = setTimeout(() => {
+      void renewSubscription();
+    }, renewDelayMs);
+  };
+
+  const establishSubscription = async (reason: string) => {
+    const eventsXaddr = await getEventsXaddr(cfg, requestTimeoutMs);
+    if (!eventsXaddr) {
+      log('No Events XAddr found');
+      throw new Error('No Events XAddr found');
+    }
+    log('Events XAddr', eventsXaddr);
+
+    const nextSubscription = await createPullPointSubscription(eventsXaddr, cfg, requestTimeoutMs);
+    if (!nextSubscription) {
+      log('Failed to create PullPoint subscription');
+      throw new Error('Failed to create PullPoint subscription');
+    }
+
+    state.subscription = nextSubscription;
+    consecutiveFailures = 0;
+    lastSuccessfulPollAt = 0;
+    scheduleRenewal(nextSubscription);
+    logInfo(`[INFO] PullPoint subscription established camera=${cfg.name} subscription=${redactUrl(nextSubscription.address)} reason=${reason}`);
+    log('Subscription address', nextSubscription.address);
+  };
+
+  const recoverSubscription = async (reason: string) => {
+    if (stopped) return;
+    if (recoveryPromise) {
+      await recoveryPromise;
+      return;
+    }
+
+    recoveryPromise = (async () => {
+      clearRenewTimer();
+      logWarn(`[WARN] Re-establishing PullPoint subscription camera=${cfg.name} reason=${reason}`);
+
+      let attempt = 0;
+      while (!stopped) {
+        attempt += 1;
+        if (attempt > 1) {
+          const backoffMs = Math.max(MIN_RESUBSCRIBE_DELAY_MS, pollIntervalMs * 2);
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        }
+
+        try {
+          await establishSubscription(`recovery:${reason}:attempt=${attempt}`);
+          logInfo(`[INFO] PullPoint subscription recovered camera=${cfg.name} attempt=${attempt}`);
+          return;
+        } catch (err) {
+          logWarn(`[WARN] PullPoint recovery attempt failed camera=${cfg.name} attempt=${attempt}`, err);
+        }
+      }
+    })().finally(() => {
+      recoveryPromise = null;
+    });
+
+    await recoveryPromise;
+  };
+
+  const renewSubscription = async () => {
+    if (stopped || recoveryPromise || !state.subscription) return;
+
+    const currentSubscription = state.subscription;
+    const renewed = await renewPullPointSubscription(currentSubscription.address, cfg, requestTimeoutMs);
+    if (renewed) {
+      state.subscription = {
+        ...currentSubscription,
+        currentTimeMs: renewed.currentTimeMs,
+        terminationTimeMs: renewed.terminationTimeMs,
+      };
+      scheduleRenewal(state.subscription);
+      logInfo(`[INFO] PullPoint subscription renewed camera=${cfg.name} subscription=${redactUrl(state.subscription.address)}`);
+      return;
+    }
+
+    logWarn(`[WARN] PullPoint renewal failed; re-subscribing camera=${cfg.name} subscription=${redactUrl(currentSubscription.address)}`);
+    await recoverSubscription('renew failed');
+  };
+
+  await establishSubscription('startup');
 
   (async () => {
     while (!stopped) {
       try {
-        const xml = await pullMessagesOnce(subscriptionAddr, cfg);
+        if (!state.subscription) {
+          await recoverSubscription('missing subscription');
+          await new Promise((res) => setTimeout(res, pollIntervalMs));
+          continue;
+        }
+
+        if (channelHealthy && lastSuccessfulPollAt > 0) {
+          const ageMs = Date.now() - lastSuccessfulPollAt;
+          if (ageMs > channelStaleThresholdMs) {
+            channelHealthy = false;
+            hooks?.onError?.(new Error(`Pull channel stale; last successful poll ${ageMs}ms ago`));
+            await recoverSubscription(`stale channel ageMs=${ageMs}`);
+            await new Promise((res) => setTimeout(res, pollIntervalMs));
+            continue;
+          }
+        }
+
+        const currentSubscription = state.subscription;
+        const xml = await pullMessagesOnce(currentSubscription.address, cfg, requestTimeoutMs);
         if (xml) {
+          consecutiveFailures = 0;
+          lastSuccessfulPollAt = Date.now();
           if (!channelHealthy) {
             channelHealthy = true;
             hooks?.onHealthy?.();
-          }
-          if (!healthyLogged) {
-            healthyLogged = true;
             logInfo(`[INFO] PullPoint polling healthy camera=${cfg.name}`);
           }
           const obj = parser.parse(xml);
@@ -828,14 +1146,25 @@ export async function startPullPoint(
           for (const et of evTypes) {
             cb({ type: et.type, state: et.state });
           }
-        } else if (channelHealthy) {
-          channelHealthy = false;
-          hooks?.onError?.(new Error('PullMessages failed or returned no data'));
+        } else {
+          consecutiveFailures += 1;
+          if (channelHealthy) {
+            channelHealthy = false;
+            hooks?.onError?.(new Error('PullMessages failed or returned no data'));
+          }
+
+          if (consecutiveFailures >= PULL_FAILURES_BEFORE_RESUBSCRIBE) {
+            await recoverSubscription(`pull failures=${consecutiveFailures}`);
+          }
         }
       } catch (err) {
+        consecutiveFailures += 1;
         if (channelHealthy) {
           channelHealthy = false;
           hooks?.onError?.(err);
+        }
+        if (consecutiveFailures >= PULL_FAILURES_BEFORE_RESUBSCRIBE) {
+          await recoverSubscription(`poll exception after ${consecutiveFailures} failures`);
         }
         log('pull loop error', err);
       }
@@ -846,6 +1175,7 @@ export async function startPullPoint(
   return {
     stop: () => {
       stopped = true;
+      clearRenewTimer();
     },
   };
 }
