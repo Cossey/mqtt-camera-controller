@@ -78,6 +78,40 @@ logging:
 - `LOG_LEVEL` environment variable is also supported
 - If both config and env are set, config level is used
 
+### Home Assistant Discovery
+
+```yaml
+homeassistant:
+  enabled: true
+  prefix: homeassistant
+  retain: true
+  components:
+    events: true
+    snapshot: true
+    snapshotCommand: true
+    appReloadCommand: true
+```
+
+- Discovery is enabled by default.
+- Set `homeassistant.enabled: false` to disable discovery publication.
+- Discovery publishes entities for event binary sensors, snapshot camera, per-camera command select, and an app command select.
+- Discovery entities use dual availability topics (`<baseTopic>/<camera>/status` and `<baseTopic>/status`) with `availability_mode: all`.
+- Discovery includes retained camera metadata on `<baseTopic>/<camera>/meta` with camera IP, ONVIF port, and event mode.
+- `homeassistant.components.appReloadCommand` controls the app-level command select entity (enabled by default).
+
+### Event Snapshot Cooldown
+
+```yaml
+rateLimit:
+  enabled: true
+  cooldownMs: 3000
+```
+
+- `rateLimit` is a root-level setting and applies globally to all cameras.
+- Cooldown applies only to event-triggered snapshots (`snapshot.onEvent`), not periodic or manual command snapshots.
+- During cooldown, event snapshots are ignored and logged at debug level.
+- `cooldownMs: 0` disables cooldown behavior.
+
 ### Camera configuration contract
 
 Use separate ONVIF and snapshot settings:
@@ -92,8 +126,10 @@ cameras:
     snapshot:
       type: url
       address: "http://192.168.1.10/snapshot.jpg"
-      onEvent: true
-      interval: 60
+      onEvent:
+        types: [motion]
+        delay: 0
+      interval: 60000
     event:
       mode: pull
       pull:
@@ -108,6 +144,11 @@ cameras:
   - `camera`: always use camera-reported endpoint
   - `configured`: always force configured host/port
 - Snapshot retrieval uses `snapshot.address` as the source endpoint.
+- If `snapshot` is omitted for a camera, periodic and on-event snapshots are disabled for that camera.
+- `snapshot.interval` is in milliseconds and defaults to `0` when omitted (`0` means disabled).
+- `snapshot.onEvent` must be an object with required `types` and optional `delay` in milliseconds (default `0`).
+  - Valid `types`: `motion`, `line`, `people`, `vehicle`, `animal`, `all`
+  - If `types` contains `all`, it must be the only value in the list.
 - `snapshot.enabled` is not used by runtime and should be omitted.
 
 Snapshot credentials priority (applies to both `snapshot.type: url` and `snapshot.type: stream`):
@@ -147,6 +188,27 @@ Snapshot topic:
 - `<baseTopic>/<cameraName>/image`
 - Payload is binary image data
 - Snapshot publishes are non-retained
+
+Camera command topic:
+
+- `<baseTopic>/<cameraName>/command`
+
+Camera command behavior:
+
+- Publish payload `snapshot` (case-insensitive) to request an immediate snapshot
+- Unsupported command payloads are ignored (debug log)
+- On success, image data is published to `<baseTopic>/<cameraName>/image`
+- If snapshot configuration is missing or invalid for that camera, no image will be published
+
+Global app command topic:
+
+- `<baseTopic>/command`
+
+Global app command behavior:
+
+- Publish payload `reload` (case-insensitive) to request a runtime config reload
+- Unsupported payloads are ignored (debug log)
+- Reload uses the same transactional flow as `SIGHUP` (including rollback on failure)
 
 ## Event mapping rules
 
@@ -217,6 +279,9 @@ ONVIF request strategy is secure-first:
 - Push path mismatch: logs include received path and expected base path
 - Unknown events: visible at `debug` log level
 - For low-level namespace traces, use `DEBUG=*`
+- Send `SIGHUP` to trigger runtime config reload without restarting the process.
+- Publish `reload` to `<baseTopic>/command` to trigger runtime config reload through MQTT.
+- Set `MQTT_CAM_CONFIG_RELOAD=true` to watch the active config file path and auto-reload when it changes (debounced).
 
 ## Development commands
 

@@ -14,6 +14,7 @@ mqtt:
   # url: optional if you prefer to set the full URL directly (e.g. mqtt://user:pass@host:1883)
 
 # Cameras can be specified in two supported ways:
+# If a camera omits the snapshot section entirely, periodic and on-event snapshots are disabled.
 
 # 1) Mapping form: name -> camera object
 cameras:
@@ -29,8 +30,12 @@ cameras:
       type: url
       # unified snapshot address for either mode (HTTP URL or RTSP/RTMP stream)
       address: "http://192.168.1.10/snapshot.jpg"
-      interval: 0       # seconds; 0 = disabled
-      onEvent: true
+      interval: 0       # milliseconds; default 0 = disabled
+      onEvent:
+        # required when onEvent is specified. valid values: motion, line, people, vehicle, animal, all
+        # when 'all' is used it must be the only value in this list.
+        types: [motion, line]
+        delay: 0        # milliseconds; default 0
       # snapshot-specific credentials (preferred to use Docker secret files)
       # username: "user"
       # password_file: /run/secrets/frontdoor_snapshot_password
@@ -64,8 +69,10 @@ cameras:
       # if provided, they override embedded credentials in address.
       # username: "user"
       # password_file: /run/secrets/driveway_stream_snapshot_password
-      interval: 60
-      onEvent: true
+      interval: 60000
+      onEvent:
+        types: [all]
+        delay: 250
     durations:
       motion: 5
       line: 10
@@ -98,5 +105,21 @@ notify:
 # Optional global settings
 logging:
   level: "info"  # debug, info, warn, error
+
+# Optional Home Assistant MQTT discovery (enabled by default)
+homeassistant:
+  enabled: true
+  prefix: "homeassistant"
+  retain: true
+  components:
+    events: true
+    snapshot: true
+    snapshotCommand: true
+    appReloadCommand: true
+
+# Optional root event snapshot cooldown limiter (applies only to onEvent snapshots)
+rateLimit:
+  enabled: true
+  cooldownMs: 3000
 
 # Templates and advanced mappings are possible (future)

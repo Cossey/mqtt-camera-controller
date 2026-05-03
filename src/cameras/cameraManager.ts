@@ -11,6 +11,7 @@ export class CameraManager {
   cameras: Camera[] = [];
   cfg: AppConfig;
   mqtt: MQTTWrapper;
+  private periodicSnapshotTimers: Array<ReturnType<typeof setInterval>> = [];
 
   constructor(cfg: AppConfig, mqtt: MQTTWrapper) {
     this.cfg = cfg;
@@ -19,7 +20,7 @@ export class CameraManager {
 
   async init() {
     for (const camCfg of this.cfg.cameras) {
-      const cam = new Camera(camCfg, this.mqtt);
+      const cam = new Camera(camCfg, this.mqtt, this.cfg.rateLimit);
 
       // Initialize retained baseline event and status state so dashboards have deterministic startup values.
       for (const topic of EVENT_BASELINE_TOPICS) {
@@ -75,17 +76,35 @@ export class CameraManager {
       }
 
       // Setup periodic snapshots if configured
-      if (camCfg.snapshot?.interval && camCfg.snapshot.interval > 0) {
-        setInterval(async () => {
+      if (typeof camCfg.snapshot?.interval === 'number' && camCfg.snapshot.interval > 0) {
+        const timer = setInterval(async () => {
           try {
             const snap = await cam.getSnapshot();
             await cam.publishSnapshot(snap);
           } catch (err) {
             log('periodic snapshot failed', camCfg.name, err);
           }
-        }, (camCfg.snapshot.interval || 60) * 1000);
+        }, camCfg.snapshot.interval);
+        this.periodicSnapshotTimers.push(timer);
       }
     }
+
+    if (typeof (this.mqtt as unknown as { publishRaw?: unknown }).publishRaw === 'function') {
+      const { publishHomeAssistantDiscovery } = await import('../homeassistant/discovery');
+      await publishHomeAssistantDiscovery(this.cfg, this.mqtt);
+    }
+  }
+
+  async stop() {
+    for (const timer of this.periodicSnapshotTimers) {
+      clearInterval(timer);
+    }
+    this.periodicSnapshotTimers = [];
+
+    for (const camera of this.cameras) {
+      await camera.stop();
+    }
+    this.cameras = [];
   }
 
   getCameraByName(name: string) {

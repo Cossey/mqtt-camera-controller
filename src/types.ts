@@ -18,10 +18,22 @@ export interface ChannelConfig {
   onDuration?: number;
 }
 
+export type SnapshotTriggerType = 'motion' | 'line' | 'people' | 'vehicle' | 'animal' | 'all';
+
+export interface SnapshotOnEventConfig {
+  types: SnapshotTriggerType[];
+  delay?: number; // milliseconds
+}
+
+export interface RateLimitConfig {
+  enabled?: boolean;
+  cooldownMs?: number;
+}
+
 export interface SnapshotConfig {
   enabled?: boolean;
-  interval?: number; // seconds
-  onEvent?: boolean;
+  interval?: number; // milliseconds
+  onEvent?: SnapshotOnEventConfig;
   // snapshot type: 'url' to fetch HTTP snapshot, 'stream' to grab a frame via ffmpeg from a stream
   type?: 'url' | 'stream';
   // unified address for snapshot (HTTP or stream). This replaces separate url/stream fields.
@@ -76,9 +88,25 @@ export interface CameraConfig {
 
 export type LogLevelName = 'debug' | 'info' | 'warn' | 'error';
 
+export interface HomeAssistantConfig {
+  enabled?: boolean;
+  prefix?: string;
+  retain?: boolean;
+  components?: {
+    events?: boolean;
+    // Deprecated compatibility toggle; status is no longer a standalone discovery entity.
+    status?: boolean;
+    snapshot?: boolean;
+    snapshotCommand?: boolean;
+    appReloadCommand?: boolean;
+  };
+}
+
 export interface AppConfig {
   mqtt: MqttConfig;
   cameras: CameraConfig[];
+  rateLimit?: RateLimitConfig;
+  homeassistant?: HomeAssistantConfig;
   // optional HTTP notify server configuration for ONVIF push mode
   notify?: {
     // external URL base used when requesting camera to POST events back (e.g. https://myhost.example)

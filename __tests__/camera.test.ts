@@ -94,6 +94,173 @@ describe('Camera event publishing', () => {
   });
 });
 
+describe('Camera onEvent snapshot behavior', () => {
+  test('triggers snapshot only when event type matches snapshot.onEvent.types', async () => {
+    const mqtt = {
+      publish: jest.fn(),
+      subscribe: jest.fn(),
+    } as any;
+
+    const cfg: CameraConfig = {
+      name: 'frontdoor',
+      snapshot: {
+        address: 'http://192.168.1.10/snap.jpg',
+        onEvent: {
+          types: ['motion'],
+          delay: 0,
+        },
+      },
+    };
+
+    const cam = new Camera(cfg, mqtt);
+    const getSnapshotSpy = jest.spyOn(cam, 'getSnapshot').mockResolvedValue(Buffer.from('image'));
+    const publishSnapshotSpy = jest.spyOn(cam, 'publishSnapshot').mockResolvedValue(undefined);
+
+    await cam.handleEvent({ type: 'people', state: true });
+    expect(getSnapshotSpy).not.toHaveBeenCalled();
+
+    await cam.handleEvent({ type: 'motion', state: true });
+    expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+    expect(publishSnapshotSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test('coalesces delayed event snapshots to one pending snapshot per camera', async () => {
+    jest.useFakeTimers();
+    try {
+      const mqtt = {
+        publish: jest.fn(),
+        subscribe: jest.fn(),
+      } as any;
+
+      const cfg: CameraConfig = {
+        name: 'frontdoor',
+        snapshot: {
+          address: 'http://192.168.1.10/snap.jpg',
+          onEvent: {
+            types: ['motion'],
+            delay: 100,
+          },
+        },
+      };
+
+      const cam = new Camera(cfg, mqtt);
+      const getSnapshotSpy = jest.spyOn(cam, 'getSnapshot').mockResolvedValue(Buffer.from('image'));
+      const publishSnapshotSpy = jest.spyOn(cam, 'publishSnapshot').mockResolvedValue(undefined);
+
+      await cam.handleEvent({ type: 'motion', state: true });
+      await jest.advanceTimersByTimeAsync(50);
+
+      await cam.handleEvent({ type: 'motion', state: true });
+      await jest.advanceTimersByTimeAsync(99);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(0);
+
+      await jest.advanceTimersByTimeAsync(1);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+      expect(publishSnapshotSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('drops event-triggered snapshots while cooldown is active', async () => {
+    jest.useFakeTimers();
+    try {
+      jest.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      const mqtt = {
+        publish: jest.fn(),
+        subscribe: jest.fn(),
+      } as any;
+
+      const cfg: CameraConfig = {
+        name: 'frontdoor',
+        snapshot: {
+          address: 'http://192.168.1.10/snap.jpg',
+          onEvent: {
+            types: ['motion'],
+            delay: 0,
+          },
+        },
+      };
+
+      const cam = new Camera(cfg, mqtt, { enabled: true, cooldownMs: 3000 });
+      const getSnapshotSpy = jest.spyOn(cam, 'getSnapshot').mockResolvedValue(Buffer.from('image'));
+
+      await cam.handleEvent({ type: 'motion', state: true });
+      await cam.handleEvent({ type: 'motion', state: true });
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+
+      jest.setSystemTime(new Date('2026-01-01T00:00:03.001Z'));
+      await cam.handleEvent({ type: 'motion', state: true });
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('cooldown starts after failed event snapshot attempt', async () => {
+    jest.useFakeTimers();
+    try {
+      jest.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      const mqtt = {
+        publish: jest.fn(),
+        subscribe: jest.fn(),
+      } as any;
+
+      const cfg: CameraConfig = {
+        name: 'frontdoor',
+        snapshot: {
+          address: 'http://192.168.1.10/snap.jpg',
+          onEvent: {
+            types: ['motion'],
+            delay: 0,
+          },
+        },
+      };
+
+      const cam = new Camera(cfg, mqtt, { enabled: true, cooldownMs: 3000 });
+      const getSnapshotSpy = jest
+        .spyOn(cam, 'getSnapshot')
+        .mockRejectedValueOnce(new Error('fetch failed'))
+        .mockResolvedValue(Buffer.from('image'));
+
+      await cam.handleEvent({ type: 'motion', state: true });
+      await cam.handleEvent({ type: 'motion', state: true });
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+
+      jest.setSystemTime(new Date('2026-01-01T00:00:03.001Z'));
+      await cam.handleEvent({ type: 'motion', state: true });
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('allows all event snapshots when cooldownMs is 0', async () => {
+    const mqtt = {
+      publish: jest.fn(),
+      subscribe: jest.fn(),
+    } as any;
+
+    const cfg: CameraConfig = {
+      name: 'frontdoor',
+      snapshot: {
+        address: 'http://192.168.1.10/snap.jpg',
+        onEvent: {
+          types: ['motion'],
+          delay: 0,
+        },
+      },
+    };
+
+    const cam = new Camera(cfg, mqtt, { enabled: true, cooldownMs: 0 });
+    const getSnapshotSpy = jest.spyOn(cam, 'getSnapshot').mockResolvedValue(Buffer.from('image'));
+
+    await cam.handleEvent({ type: 'motion', state: true });
+    await cam.handleEvent({ type: 'motion', state: true });
+    expect(getSnapshotSpy).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('Camera stream snapshot credentials', () => {
   test('stream snapshot injects explicit snapshot username/password into ffmpeg input URL', async () => {
     const mqtt = { publish: jest.fn(), subscribe: jest.fn() } as any;
@@ -228,13 +395,54 @@ describe('CameraManager startup baselines', () => {
       ],
     } as any, mqtt);
 
-    await manager.init();
+    try {
+      await manager.init();
 
-    expect(mqtt.publish).toHaveBeenCalledWith('driveway/motion', 'OFF', { retain: true });
-    expect(mqtt.publish).toHaveBeenCalledWith('driveway/line', 'OFF', { retain: true });
-    expect(mqtt.publish).toHaveBeenCalledWith('driveway/people', 'OFF', { retain: true });
-    expect(mqtt.publish).toHaveBeenCalledWith('driveway/vehicle', 'OFF', { retain: true });
-    expect(mqtt.publish).toHaveBeenCalledWith('driveway/animal', 'OFF', { retain: true });
-    expect(mqtt.publish).toHaveBeenCalledWith('driveway/status', 'OFFLINE', { retain: true });
+      expect(mqtt.publish).toHaveBeenCalledWith('driveway/motion', 'OFF', { retain: true });
+      expect(mqtt.publish).toHaveBeenCalledWith('driveway/line', 'OFF', { retain: true });
+      expect(mqtt.publish).toHaveBeenCalledWith('driveway/people', 'OFF', { retain: true });
+      expect(mqtt.publish).toHaveBeenCalledWith('driveway/vehicle', 'OFF', { retain: true });
+      expect(mqtt.publish).toHaveBeenCalledWith('driveway/animal', 'OFF', { retain: true });
+      expect(mqtt.publish).toHaveBeenCalledWith('driveway/status', 'OFFLINE', { retain: true });
+    } finally {
+      await manager.stop();
+    }
+  });
+
+  test('uses snapshot.interval as milliseconds for periodic snapshots', async () => {
+    const mqtt = {
+      publish: jest.fn(),
+      subscribe: jest.fn(),
+    } as any;
+
+    const setIntervalSpy = jest.spyOn(global, 'setInterval');
+
+    try {
+      const manager = new CameraManager({
+        mqtt: { server: 'example.com' },
+        cameras: [
+          {
+            name: 'driveway',
+            host: '192.168.1.20',
+            port: 80,
+            snapshot: {
+              address: 'http://192.168.1.20/snap.jpg',
+              interval: 250,
+            },
+            event: { mode: 'push' },
+          },
+        ],
+      } as any, mqtt);
+
+      try {
+        await manager.init();
+
+        expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 250);
+      } finally {
+        await manager.stop();
+      }
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
   });
 });

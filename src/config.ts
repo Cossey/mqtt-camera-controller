@@ -1,7 +1,145 @@
 import fs from 'fs';
 import path from 'path';
 import YAML from 'yaml';
-import { AppConfig, CameraConfig, RawCameraEntry, MqttConfig, SnapshotConfig, LogLevelName } from './types';
+import { AppConfig, CameraConfig, RawCameraEntry, MqttConfig, SnapshotConfig, LogLevelName, HomeAssistantConfig, RateLimitConfig } from './types';
+
+const VALID_SNAPSHOT_EVENT_TYPES = ['motion', 'line', 'people', 'vehicle', 'animal', 'all'] as const;
+
+function normalizeBoolean(value: unknown, defaultValue: boolean, fieldName: string): boolean {
+  if (value === undefined) return defaultValue;
+  if (typeof value === 'boolean') return value;
+  throw new Error(`${fieldName} must be a boolean`);
+}
+
+function normalizeRateLimit(raw: unknown): RateLimitConfig {
+  const r = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  if (r.cooldownMs !== undefined && typeof r.cooldownMs !== 'number') {
+    throw new Error('rateLimit.cooldownMs must be a non-negative number (milliseconds)');
+  }
+  return {
+    enabled: normalizeBoolean(r.enabled, true, 'rateLimit.enabled'),
+    cooldownMs: typeof r.cooldownMs === 'number' ? r.cooldownMs : 3000,
+  };
+}
+
+function validateRateLimitConfiguration(rateLimit: RateLimitConfig) {
+  if (rateLimit.enabled !== undefined && typeof rateLimit.enabled !== 'boolean') {
+    throw new Error('rateLimit.enabled must be a boolean');
+  }
+
+  if (typeof rateLimit.cooldownMs !== 'number' || !Number.isFinite(rateLimit.cooldownMs) || rateLimit.cooldownMs < 0) {
+    throw new Error('rateLimit.cooldownMs must be a non-negative number (milliseconds)');
+  }
+}
+
+function normalizeHomeAssistant(raw: unknown): HomeAssistantConfig {
+  const h = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  if (h.prefix !== undefined && typeof h.prefix !== 'string') {
+    throw new Error('homeassistant.prefix must be a non-empty string');
+  }
+  if (h.components !== undefined && typeof h.components !== 'object') {
+    throw new Error('homeassistant.components must be an object');
+  }
+  const components = h.components && typeof h.components === 'object'
+    ? (h.components as Record<string, unknown>)
+    : {};
+
+  return {
+    enabled: normalizeBoolean(h.enabled, true, 'homeassistant.enabled'),
+    prefix: typeof h.prefix === 'string' ? h.prefix : 'homeassistant',
+    retain: normalizeBoolean(h.retain, true, 'homeassistant.retain'),
+    components: {
+      events: normalizeBoolean(components.events, true, 'homeassistant.components.events'),
+      status: normalizeBoolean(components.status, true, 'homeassistant.components.status'),
+      snapshot: normalizeBoolean(components.snapshot, true, 'homeassistant.components.snapshot'),
+      snapshotCommand: normalizeBoolean(components.snapshotCommand, true, 'homeassistant.components.snapshotCommand'),
+      appReloadCommand: normalizeBoolean(components.appReloadCommand, true, 'homeassistant.components.appReloadCommand'),
+    },
+  };
+}
+
+function validateHomeAssistantConfiguration(homeAssistant: HomeAssistantConfig) {
+  if (homeAssistant.enabled !== undefined && typeof homeAssistant.enabled !== 'boolean') {
+    throw new Error('homeassistant.enabled must be a boolean');
+  }
+
+  if (homeAssistant.retain !== undefined && typeof homeAssistant.retain !== 'boolean') {
+    throw new Error('homeassistant.retain must be a boolean');
+  }
+
+  if (typeof homeAssistant.prefix !== 'string' || homeAssistant.prefix.trim().length === 0) {
+    throw new Error('homeassistant.prefix must be a non-empty string');
+  }
+
+  const components = homeAssistant.components;
+  if (!components) return;
+  if (components.events !== undefined && typeof components.events !== 'boolean') {
+    throw new Error('homeassistant.components.events must be a boolean');
+  }
+  if (components.status !== undefined && typeof components.status !== 'boolean') {
+    throw new Error('homeassistant.components.status must be a boolean');
+  }
+  if (components.snapshot !== undefined && typeof components.snapshot !== 'boolean') {
+    throw new Error('homeassistant.components.snapshot must be a boolean');
+  }
+  if (components.snapshotCommand !== undefined && typeof components.snapshotCommand !== 'boolean') {
+    throw new Error('homeassistant.components.snapshotCommand must be a boolean');
+  }
+  if (components.appReloadCommand !== undefined && typeof components.appReloadCommand !== 'boolean') {
+    throw new Error('homeassistant.components.appReloadCommand must be a boolean');
+  }
+}
+
+function validateSnapshotConfiguration(cameras: CameraConfig[]) {
+  for (const cam of cameras) {
+    const snapshot = cam.snapshot;
+    if (!snapshot) continue;
+
+    if (snapshot.interval === undefined) {
+      snapshot.interval = 0;
+    }
+
+    if (typeof snapshot.interval !== 'number' || !Number.isFinite(snapshot.interval) || snapshot.interval < 0) {
+      throw new Error(`Camera '${cam.name}' has invalid snapshot.interval; expected a non-negative number (milliseconds)`);
+    }
+
+    if (snapshot.onEvent !== undefined) {
+      if (!snapshot.onEvent || typeof snapshot.onEvent !== 'object' || Array.isArray(snapshot.onEvent)) {
+        throw new Error(`Camera '${cam.name}' has invalid snapshot.onEvent; expected object with required 'types'`);
+      }
+
+      const rawTypes = (snapshot.onEvent as { types?: unknown }).types;
+      if (!Array.isArray(rawTypes) || rawTypes.length === 0) {
+        throw new Error(`Camera '${cam.name}' has invalid snapshot.onEvent.types; expected a non-empty array`);
+      }
+
+      const normalizedTypes = rawTypes.map((t) => String(t).trim().toLowerCase());
+      const invalidTypes = normalizedTypes.filter((t) => !VALID_SNAPSHOT_EVENT_TYPES.includes(t as typeof VALID_SNAPSHOT_EVENT_TYPES[number]));
+      if (invalidTypes.length > 0) {
+        throw new Error(`Camera '${cam.name}' has invalid snapshot.onEvent.types values: ${invalidTypes.join(', ')}`);
+      }
+
+      if (normalizedTypes.includes('all') && normalizedTypes.length > 1) {
+        throw new Error(`Camera '${cam.name}' has invalid snapshot.onEvent.types; 'all' must be the only value when present`);
+      }
+
+      snapshot.onEvent.types = normalizedTypes as typeof snapshot.onEvent.types;
+
+      if (snapshot.onEvent.delay === undefined) {
+        snapshot.onEvent.delay = 0;
+      }
+
+      if (typeof snapshot.onEvent.delay !== 'number' || !Number.isFinite(snapshot.onEvent.delay) || snapshot.onEvent.delay < 0) {
+        throw new Error(`Camera '${cam.name}' has invalid snapshot.onEvent.delay; expected a non-negative number (milliseconds)`);
+      }
+    }
+
+    const hasActiveSnapshotTrigger = snapshot.interval > 0 || snapshot.onEvent !== undefined;
+    if (hasActiveSnapshotTrigger && (!snapshot.address || snapshot.address.trim().length === 0)) {
+      throw new Error(`Camera '${cam.name}' requires snapshot.address when snapshot interval or onEvent is configured`);
+    }
+  }
+}
 
 function normalizeEndpointSelection(raw: unknown): 'auto' | 'camera' | 'configured' | undefined {
   if (typeof raw !== 'string') return undefined;
@@ -63,7 +201,7 @@ function normalizeCamera(name: string, entry: RawCameraEntry): CameraConfig {
   const port = (e.port as number) || undefined;
 
   // snapshot normalization: unified address field
-  const snapshotCfg = (e.snapshot as SnapshotConfig) || undefined;
+  const snapshotCfg = (e.snapshot && typeof e.snapshot === 'object') ? { ...(e.snapshot as SnapshotConfig) } : undefined;
   let snapshotAddr = (e.url as string) || (e.snapshotUrl as string) || undefined;
   if (snapshotCfg && snapshotCfg.address) snapshotAddr = snapshotCfg.address;
 
@@ -80,6 +218,14 @@ function normalizeCamera(name: string, entry: RawCameraEntry): CameraConfig {
   if (snapshotAddr) {
     if (!cfg.snapshot) cfg.snapshot = {} as SnapshotConfig;
     cfg.snapshot.address = snapshotAddr;
+  }
+
+  if (cfg.snapshot && cfg.snapshot.interval === undefined) {
+    cfg.snapshot.interval = 0;
+  }
+
+  if (cfg.snapshot?.onEvent && typeof cfg.snapshot.onEvent === 'object' && cfg.snapshot.onEvent.delay === undefined) {
+    cfg.snapshot.onEvent.delay = 0;
   }
 
   // support snapshot-specific username/password/password_file
@@ -114,7 +260,7 @@ function normalizeCamera(name: string, entry: RawCameraEntry): CameraConfig {
   return cfg;
 }
 
-export function loadConfig(configPath?: string): AppConfig {
+export function resolveConfigPath(configPath?: string): string {
   // Do NOT use config.yaml.example in production. Only include the example as a fallback when
   // running tests (NODE_ENV=test) or explicitly requested via USE_EXAMPLE_CONFIG=true
   const includeExample = process.env.NODE_ENV === 'test' || process.env.USE_EXAMPLE_CONFIG === 'true';
@@ -124,21 +270,25 @@ export function loadConfig(configPath?: string): AppConfig {
     path.join(process.cwd(), 'config.yaml'),
   ];
   if (includeExample) candidates.push(path.join(process.cwd(), 'config.yaml.example'));
-  const candidatesFiltered = candidates.filter(Boolean) as string[];
 
-  let p: string | undefined;
-  for (const c of candidatesFiltered) {
-    if (c && fs.existsSync(c)) {
-      p = c;
-      break;
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) {
+      return candidate;
     }
   }
-  if (!p) throw new Error('No configuration file found (looked for CONFIG_PATH, config.yaml)');
+
+  throw new Error('No configuration file found (looked for CONFIG_PATH, config.yaml)');
+}
+
+export function loadConfig(configPath?: string): AppConfig {
+  const p = resolveConfigPath(configPath);
 
   const content = fs.readFileSync(p, 'utf8');
   const raw = p.endsWith('.yaml') || p.endsWith('.yml') ? YAML.parse(content) : JSON.parse(content);
 
   const mqtt = normalizeMqtt(raw.mqtt || raw.MQTT || raw.Mqtt);
+  const rateLimit = normalizeRateLimit(raw.rateLimit || raw.ratelimit);
+  const homeAssistant = normalizeHomeAssistant(raw.homeassistant || raw.homeAssistant || raw.hass);
 
   const camerasRaw = raw.cameras || raw.Cameras || raw.onvif || {};
   const cameras: CameraConfig[] = [];
@@ -206,8 +356,11 @@ export function loadConfig(configPath?: string): AppConfig {
     }
   }
 
+  validateSnapshotConfiguration(cameras);
+  validateRateLimitConfiguration(rateLimit);
+  validateHomeAssistantConfiguration(homeAssistant);
   validateCameraOnvifConnectivity(cameras);
 
-  const cfg: AppConfig = { mqtt, cameras, notify: notifyCfg, logging: loggingCfg };
+  const cfg: AppConfig = { mqtt, cameras, rateLimit, homeassistant: homeAssistant, notify: notifyCfg, logging: loggingCfg };
   return cfg;
 }

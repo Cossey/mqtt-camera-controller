@@ -7,6 +7,8 @@ services:
       NODE_ENV: "production"
       # Make sure the container loads the config from this path
       CONFIG_PATH: /app/config.yaml
+      # Optional: set true to auto-reload when the config file changes
+      MQTT_CAM_CONFIG_RELOAD: "false"
     volumes:
       # Bind the repo root example or your live config into the container
       - ./config.yaml:/app/config.yaml:ro

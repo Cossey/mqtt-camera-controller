@@ -1,16 +1,21 @@
 import debug from 'debug';
 import { spawn } from 'child_process';
 import fs from 'fs';
-import { CameraConfig } from '../types';
+import { CameraConfig, RateLimitConfig } from '../types';
 import { MQTTWrapper } from '../mqttClient';
-import { logInfo, logError } from '../logger';
+import { logInfo, logError, logDebug } from '../logger';
 
 const log = debug('camera');
 
 export class Camera {
   cfg: CameraConfig;
   mqtt: MQTTWrapper;
+  private rateLimit: RateLimitConfig;
   private lastEventChannelStatus: 'online' | 'offline' | null = null;
+  private pendingOnEventSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastOnEventSnapshotAttemptAt = 0;
+  private pullSubscription: { stop: () => void } | null = null;
+  private unsubscribeSnapshotCommand: (() => void) | null = null;
 
   private normalizeCredential(v?: string): string | undefined {
     if (typeof v !== 'string') return undefined;
@@ -70,9 +75,64 @@ export class Camera {
     return text.replace(/([a-z][a-z0-9+.-]*:\/\/)([^@\s/:]+)(?::([^@\s/]*))?@/gi, '$1***:***@');
   }
 
-  constructor(cfg: CameraConfig, mqtt: MQTTWrapper) {
+  private getOnEventSnapshotSettings() {
+    const onEvent = this.cfg.snapshot?.onEvent;
+    if (!onEvent) return null;
+    if (!Array.isArray(onEvent.types) || onEvent.types.length === 0) return null;
+
+    const types = new Set(onEvent.types.map((t) => String(t).toLowerCase()));
+    const delay = typeof onEvent.delay === 'number' && Number.isFinite(onEvent.delay) && onEvent.delay >= 0 ? onEvent.delay : 0;
+    return { types, delay };
+  }
+
+  private isOnEventSnapshotInCooldown(): boolean {
+    if (!this.rateLimit.enabled) return false;
+    const cooldownMs = typeof this.rateLimit.cooldownMs === 'number' ? this.rateLimit.cooldownMs : 3000;
+    if (cooldownMs <= 0) return false;
+    const elapsedMs = Date.now() - this.lastOnEventSnapshotAttemptAt;
+    return elapsedMs < cooldownMs;
+  }
+
+  private async takeSnapshotForEventTrigger() {
+    if (this.isOnEventSnapshotInCooldown()) {
+      logDebug(`[DEBUG] Event snapshot skipped due to cooldown camera=${this.cfg.name}`);
+      return;
+    }
+
+    this.lastOnEventSnapshotAttemptAt = Date.now();
+
+    try {
+      const snap = await this.getSnapshot();
+      await this.publishSnapshot(snap);
+    } catch (err) {
+      log('snapshot on event failed', err);
+    }
+  }
+
+  private scheduleSnapshotForEventTrigger(delayMs: number) {
+    if (delayMs <= 0) {
+      void this.takeSnapshotForEventTrigger();
+      return;
+    }
+
+    if (this.pendingOnEventSnapshotTimer) {
+      clearTimeout(this.pendingOnEventSnapshotTimer);
+      this.pendingOnEventSnapshotTimer = null;
+    }
+
+    this.pendingOnEventSnapshotTimer = setTimeout(() => {
+      this.pendingOnEventSnapshotTimer = null;
+      void this.takeSnapshotForEventTrigger();
+    }, delayMs);
+  }
+
+  constructor(cfg: CameraConfig, mqtt: MQTTWrapper, rateLimit?: RateLimitConfig) {
     this.cfg = cfg;
     this.mqtt = mqtt;
+    this.rateLimit = {
+      enabled: rateLimit?.enabled ?? true,
+      cooldownMs: rateLimit?.cooldownMs ?? 3000,
+    };
   }
 
   async setEventChannelStatus(status: 'online' | 'offline', reason?: string) {
@@ -90,7 +150,13 @@ export class Camera {
     log('Initialized camera (no onvif client)', this.cfg.name);
 
     // Subscribe to commands for snapshot requests
-    this.mqtt.subscribe(`${this.cfg.name}/command/snapshot`, async (_t: string, _message: Buffer) => {
+    this.unsubscribeSnapshotCommand = this.mqtt.subscribe(`${this.cfg.name}/command`, async (_t: string, message: Buffer) => {
+      const command = message.toString('utf8').trim().toLowerCase();
+      if (command !== 'snapshot') {
+        logDebug(`[DEBUG] Unsupported camera command ignored camera=${this.cfg.name} command=${command || '<empty>'}`);
+        return;
+      }
+
       log('snapshot command for', this.cfg.name);
       try {
         const snap = await this.getSnapshot();
@@ -106,7 +172,7 @@ export class Camera {
     if (mode === 'pull') {
       try {
         const { startPullPoint } = await import('../onvif/pullPoint');
-        await startPullPoint(this.cfg, async (evt) => {
+        this.pullSubscription = await startPullPoint(this.cfg, async (evt) => {
           try {
             await this.handleEvent(evt);
           } catch (err: unknown) {
@@ -136,6 +202,25 @@ export class Camera {
       log('Configured for push-mode events');
       await this.setEventChannelStatus('online', 'push mode configured');
     }
+  }
+
+  async stop() {
+    if (this.pendingOnEventSnapshotTimer) {
+      clearTimeout(this.pendingOnEventSnapshotTimer);
+      this.pendingOnEventSnapshotTimer = null;
+    }
+
+    if (this.pullSubscription) {
+      this.pullSubscription.stop();
+      this.pullSubscription = null;
+    }
+
+    if (this.unsubscribeSnapshotCommand) {
+      this.unsubscribeSnapshotCommand();
+      this.unsubscribeSnapshotCommand = null;
+    }
+
+    this.lastOnEventSnapshotAttemptAt = 0;
   }
 
   async getSnapshot(): Promise<Buffer> {
@@ -222,6 +307,8 @@ export class Camera {
   async handleEvent(event: unknown) {
     // event may be string, { type, state } or an array of such
     const evts: unknown[] = Array.isArray(event) ? (event as unknown[]) : [event];
+    const onEventSettings = this.getOnEventSnapshotSettings();
+    let shouldTriggerOnEventSnapshot = false;
 
     for (const e of evts) {
       let type: string | null = null;
@@ -239,6 +326,13 @@ export class Camera {
       }
 
       if (!type) continue;
+
+      if (onEventSettings) {
+        if (onEventSettings.types.has('all') || onEventSettings.types.has(type)) {
+          shouldTriggerOnEventSnapshot = true;
+        }
+      }
+
       const topic = `${this.cfg.name}/${type}`;
 
       const duration = this.cfg.eventDurations?.[type];
@@ -260,13 +354,8 @@ export class Camera {
       }
     }
 
-    if (this.cfg.snapshot?.onEvent) {
-      try {
-        const snap = await this.getSnapshot();
-        await this.publishSnapshot(snap);
-      } catch (err) {
-        log('snapshot on event failed', err);
-      }
+    if (onEventSettings && shouldTriggerOnEventSnapshot) {
+      this.scheduleSnapshotForEventTrigger(onEventSettings.delay);
     }
   }
 }
