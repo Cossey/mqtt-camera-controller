@@ -110,6 +110,18 @@ describe('Config loader normalization', () => {
     expect(() => loadConfig(p)).toThrow("Camera 'front-door' requires snapshot.address when snapshot interval or onEvent is configured");
   });
 
+  test('throws when camera statusHeartbeatInterval is invalid', () => {
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n    statusHeartbeatInterval: -1\n`;
+    const p = writeTempYaml(yaml);
+    expect(() => loadConfig(p)).toThrow("Camera 'front-door' has invalid statusHeartbeatInterval; expected a non-negative number (milliseconds)");
+  });
+
+  test('throws when root statusHeartbeatInterval is invalid', () => {
+    const yaml = `mqtt:\n  server: example.com\nstatusHeartbeatInterval: -1\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
+    const p = writeTempYaml(yaml);
+    expect(() => loadConfig(p)).toThrow('Invalid statusHeartbeatInterval; expected a non-negative number (milliseconds) or undefined');
+  });
+
   test('defaults homeassistant enabled and root rateLimit cooldown', () => {
     const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
     const p = writeTempYaml(yaml);

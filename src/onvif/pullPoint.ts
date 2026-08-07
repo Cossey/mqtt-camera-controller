@@ -3,6 +3,20 @@ import debug from 'debug';
 import { createHash, randomBytes } from 'crypto';
 import { CameraConfig, PullEndpointSelection } from '../types';
 import { logDebug, logError, logInfo, logWarn } from '../logger';
+import {
+  parseSecurityCapabilities,
+  selectAuthMethods,
+  logAuthCapabilities,
+  logAuthStrategy,
+  logAuthAttempt,
+  logAuthSuccess,
+  logAuthFailure,
+  logAuthDowngrade,
+  logAuthExhausted,
+  type SecurityCapabilities,
+  type AuthMethod,
+} from './authStrategy';
+import { fetchWithDigestAuth } from './digestAuth';
 
 const log = debug('pullpoint');
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@', allowBooleanAttributes: true });
@@ -507,7 +521,7 @@ async function fetchWithTimeout(
   const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
 
   try {
-    return await fetcher(url, {
+    const resp = await fetcher(url, {
       ...init,
       signal: controller.signal,
     } as {
@@ -516,6 +530,9 @@ async function fetchWithTimeout(
       body?: string;
       signal: AbortSignal;
     }) as { ok: boolean; status: number; text: () => Promise<string> };
+    // Body read must stay under the same deadline; the abort signal above only covers headers.
+    const bodyText = await resp.text();
+    return { ok: resp.ok, status: resp.status, text: () => Promise.resolve(bodyText) };
   } finally {
     clearTimeout(timer);
   }
@@ -541,7 +558,6 @@ export async function getEventsXaddr(cfg: CameraConfig, requestTimeoutMs = PULL_
       </tds:GetCapabilities>`;
 
   const headers: Record<string, string> = { 'Content-Type': 'application/soap+xml; charset=utf-8' };
-  const auth = basicAuthHeader(cfg);
   const hasCreds = Boolean(cfg.username && cfg.password);
 
   try {
@@ -552,11 +568,11 @@ export async function getEventsXaddr(cfg: CameraConfig, requestTimeoutMs = PULL_
       const obj = parser.parse(xml);
       const candidates = findEventXaddrCandidates(obj);
       const selected = pickBestEventXaddr(candidates);
-      return { candidates, selected };
+      return { candidates, selected, parsedXml: obj };
     };
 
     if (hasCreds) {
-      // Security-first: try WS-Security UsernameToken before Basic auth fallback.
+      // First attempt: try WS-Security to get capabilities
       const wsseBody = buildSoapEnvelope(bodyInner, cfg, true);
       const wsseInit = { method: 'POST', headers, body: wsseBody };
       const wsseResp = await fetchWithTimeout(fetcher, url, wsseInit as { method?: string; headers?: Record<string,string>; body?: string }, requestTimeoutMs);
@@ -565,8 +581,14 @@ export async function getEventsXaddr(cfg: CameraConfig, requestTimeoutMs = PULL_
 
       if (wsseResp.ok && !wsseFault) {
         const wsseParsed = parseCandidates(wsseTxt);
+        // Extract capabilities from response for strategy selection
+        const caps = parseSecurityCapabilities(wsseParsed.parsedXml);
+        logAuthCapabilities(cfg.name, caps, /^https:\/\//i.test(url));
+        logAuthStrategy(cfg.name, ['wsse'], /^https:\/\//i.test(url));
+
         if (wsseParsed.selected) {
           const selected = applyEventsXaddrSelection(wsseParsed.selected, cfg);
+          logAuthSuccess(cfg.name, 'wsse');
           if (!/event/i.test(wsseParsed.selected)) {
             logDebug(`[DEBUG] Events XAddr fallback selected camera=${cfg.name} xaddr=${redactUrl(wsseParsed.selected)} candidates=${wsseParsed.candidates.map((c) => redactUrl(c)).join(',')}`);
           }
@@ -574,12 +596,16 @@ export async function getEventsXaddr(cfg: CameraConfig, requestTimeoutMs = PULL_
         }
       } else {
         logDebug(`[DEBUG] GetCapabilities WSSE attempt failed camera=${cfg.name} url=${redactUrl(url)} status=${wsseResp.status} fault=${wsseFault || 'n/a'}`);
+        logAuthFailure(cfg.name, 'wsse', wsseResp.status, wsseFault);
       }
 
-      if (auth && /^http:\/\//i.test(url)) {
+      // Fallback to Basic auth
+      if (/^http:\/\//i.test(url)) {
         logWarn(`[WARN] Falling back to Basic auth over non-TLS camera=${cfg.name} url=${redactUrl(url)}`);
+        logAuthDowngrade(cfg.name, 'wsse', 'basic', 'wsse_failed_fallback_to_basic');
       }
 
+      const auth = basicAuthHeader(cfg);
       const basicHeaders: Record<string, string> = { ...headers };
       if (auth) basicHeaders.Authorization = auth;
       const basicBody = buildSoapEnvelope(bodyInner, cfg, false);
@@ -589,11 +615,14 @@ export async function getEventsXaddr(cfg: CameraConfig, requestTimeoutMs = PULL_
       const basicFault = soapFaultSummary(basicTxt);
 
       if (!basicResp.ok || basicFault) {
+        logAuthFailure(cfg.name, 'basic', basicResp.status, basicFault);
+        logAuthExhausted(cfg.name, ['wsse', 'basic'], basicResp.status);
         logError(`[ERROR] GetCapabilities failed camera=${cfg.name} url=${redactUrl(url)} status=${basicResp.status} fault=${basicFault || 'n/a'} body=${basicTxt.slice(0, 300)}`);
         return null;
       }
 
       const basicParsed = parseCandidates(basicTxt);
+      logAuthSuccess(cfg.name, 'basic');
       if (basicParsed.selected) {
         const selected = applyEventsXaddrSelection(basicParsed.selected, cfg);
         if (!/event/i.test(basicParsed.selected)) {

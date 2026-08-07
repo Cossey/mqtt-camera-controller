@@ -4,7 +4,20 @@ import http from 'http';
 import { CameraConfig, AppConfig } from '../types';
 import { CameraManager } from '../cameras/cameraManager';
 import { findEventTypesInObj } from './pullPoint';
-import { logError, logInfo, logWarn } from '../logger';
+import { logError, logInfo, logWarn, logDebug } from '../logger';
+import {
+  parseSecurityCapabilities,
+  selectAuthMethods,
+  logAuthCapabilities,
+  logAuthStrategy,
+  logAuthAttempt,
+  logAuthSuccess,
+  logAuthFailure,
+  logAuthDowngrade,
+  logAuthExhausted,
+  type SecurityCapabilities,
+  type AuthMethod,
+} from './authStrategy';
 
 const log = debug('push');
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@', allowBooleanAttributes: true });
@@ -166,12 +179,37 @@ export async function createPushSubscription(eventsXaddr: string, cfg: CameraCon
   </s:Envelope>`;
 
   const headers: Record<string, string> = { 'Content-Type': 'application/soap+xml; charset=utf-8' };
-  const auth = basicAuthHeader(cfg as CameraConfig);
-  if (auth) headers.Authorization = auth;
+  const hasCreds = Boolean(cfg.username && cfg.password);
+  const isHttpsUrl = /^https:\/\//i.test(eventsXaddr);
 
   try {
     const fetcher = (globalThis as unknown as { fetch?: typeof fetch }).fetch;
     if (!fetcher) throw new Error('Global fetch is not available');
+
+    // For push mode, use default capabilities assumption (most devices support both WS-Security and Basic)
+    const defaultCaps: SecurityCapabilities = {
+      usernameToken: true,
+      httpDigest: false,
+      tlsSupported: isHttpsUrl,
+      basicAuth: true,
+    };
+
+    if (hasCreds) {
+      logAuthCapabilities(cfg.name, defaultCaps, isHttpsUrl);
+      const methods = selectAuthMethods(defaultCaps, cfg, isHttpsUrl);
+      logAuthStrategy(cfg.name, methods, isHttpsUrl);
+
+      // For push, try Basic auth (WS-Security not typically supported in push notifications)
+      const auth = basicAuthHeader(cfg);
+      if (auth) {
+        headers.Authorization = auth;
+      }
+
+      if (/^http:\/\//i.test(eventsXaddr) && auth) {
+        logWarn(`[WARN] Falling back to Basic auth over non-TLS camera=${cfg.name} url=${eventsXaddr}`);
+      }
+    }
+
     const init = { method: 'POST', headers, body };
     const r = await fetcher(eventsXaddr, init as { method?: string; headers?: Record<string,string>; body?: string });
     const txt = await r.text();
@@ -179,15 +217,24 @@ export async function createPushSubscription(eventsXaddr: string, cfg: CameraCon
     log('createPushSubscription response', snippet);
 
     if (!r.ok) {
+      if (hasCreds) {
+        logAuthFailure(cfg.name, 'basic', r.status);
+      }
       logWarn(`[WARN] CreateSubscription failed status=${r.status} body=${snippet}`);
       return false;
     }
 
     if (/<\s*(?:\w+:)?fault\b/i.test(txt)) {
+      if (hasCreds) {
+        logAuthFailure(cfg.name, 'basic', r.status, 'soap_fault');
+      }
       logError(`[ERROR] CreateSubscription returned SOAP Fault status=${r.status} body=${snippet}`);
       return false;
     }
 
+    if (hasCreds) {
+      logAuthSuccess(cfg.name, 'basic');
+    }
     return true;
   } catch (err) {
     log('createPushSubscription error', err);

@@ -14,6 +14,7 @@ export class Camera {
   private lastEventChannelStatus: 'online' | 'offline' | null = null;
   private pendingOnEventSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
   private lastOnEventSnapshotAttemptAt = 0;
+  private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pullSubscription: { stop: () => void } | null = null;
   private unsubscribeSnapshotCommand: (() => void) | null = null;
 
@@ -356,6 +357,29 @@ export class Camera {
 
     if (onEventSettings && shouldTriggerOnEventSnapshot) {
       this.scheduleSnapshotForEventTrigger(onEventSettings.delay);
+    }
+  }
+
+  private publishStatusHeartbeat() {
+    if (this.lastEventChannelStatus !== null) {
+      const status = this.lastEventChannelStatus.toUpperCase();
+      this.mqtt.publish(`${this.cfg.name}/status`, status, { retain: true });
+    }
+  }
+
+  private startStatusHeartbeat(intervalMs: number) {
+    this.stopStatusHeartbeat();
+    if (intervalMs > 0) {
+      this.statusHeartbeatTimer = setInterval(() => {
+        this.publishStatusHeartbeat();
+      }, intervalMs);
+    }
+  }
+
+  private stopStatusHeartbeat() {
+    if (this.statusHeartbeatTimer) {
+      clearInterval(this.statusHeartbeatTimer);
+      this.statusHeartbeatTimer = null;
     }
   }
 }

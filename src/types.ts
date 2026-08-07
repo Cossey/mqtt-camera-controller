@@ -84,6 +84,8 @@ export interface CameraConfig {
       notifyPath?: string;
     };
   };
+  // Status heartbeat interval in milliseconds (0 = disabled, default: 0)
+  statusHeartbeatInterval?: number;
 }
 
 export type LogLevelName = 'debug' | 'info' | 'warn' | 'error';
@@ -119,6 +121,8 @@ export interface AppConfig {
   logging?: {
     level?: LogLevelName;
   };
+  // Global status heartbeat interval in milliseconds (0 = disabled, default: 0)
+  statusHeartbeatInterval?: number;
 }
 
 export interface EventNotification {

@@ -138,6 +138,11 @@ function validateSnapshotConfiguration(cameras: CameraConfig[]) {
     if (hasActiveSnapshotTrigger && (!snapshot.address || snapshot.address.trim().length === 0)) {
       throw new Error(`Camera '${cam.name}' requires snapshot.address when snapshot interval or onEvent is configured`);
     }
+    
+    // Validate statusHeartbeatInterval
+    if (typeof cam.statusHeartbeatInterval !== 'number' || !Number.isFinite(cam.statusHeartbeatInterval) || cam.statusHeartbeatInterval < 0) {
+      throw new Error(`Camera '${cam.name}' has invalid statusHeartbeatInterval; expected a non-negative number (milliseconds)`);
+    }
   }
 }
 
@@ -226,6 +231,11 @@ function normalizeCamera(name: string, entry: RawCameraEntry): CameraConfig {
 
   if (cfg.snapshot?.onEvent && typeof cfg.snapshot.onEvent === 'object' && cfg.snapshot.onEvent.delay === undefined) {
     cfg.snapshot.onEvent.delay = 0;
+  }
+
+  // Normalize statusHeartbeatInterval
+  if (cfg.statusHeartbeatInterval === undefined) {
+    cfg.statusHeartbeatInterval = 60000;
   }
 
   // support snapshot-specific username/password/password_file
@@ -356,11 +366,20 @@ export function loadConfig(configPath?: string): AppConfig {
     }
   }
 
+  const rawStatusHeartbeatInterval = raw.statusHeartbeatInterval;
+  let statusHeartbeatInterval: number | undefined;
+  if (rawStatusHeartbeatInterval !== undefined) {
+    if (typeof rawStatusHeartbeatInterval !== 'number' || !Number.isFinite(rawStatusHeartbeatInterval) || rawStatusHeartbeatInterval < 0) {
+      throw new Error('Invalid statusHeartbeatInterval; expected a non-negative number (milliseconds) or undefined');
+    }
+    statusHeartbeatInterval = rawStatusHeartbeatInterval;
+  }
+
   validateSnapshotConfiguration(cameras);
   validateRateLimitConfiguration(rateLimit);
   validateHomeAssistantConfiguration(homeAssistant);
   validateCameraOnvifConnectivity(cameras);
 
-  const cfg: AppConfig = { mqtt, cameras, rateLimit, homeassistant: homeAssistant, notify: notifyCfg, logging: loggingCfg };
+  const cfg: AppConfig = { mqtt, cameras, rateLimit, homeassistant: homeAssistant, notify: notifyCfg, logging: loggingCfg, statusHeartbeatInterval };
   return cfg;
 }
