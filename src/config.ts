@@ -92,6 +92,10 @@ function validateHomeAssistantConfiguration(homeAssistant: HomeAssistantConfig) 
 
 function validateSnapshotConfiguration(cameras: CameraConfig[]) {
   for (const cam of cameras) {
+    if (typeof cam.statusHeartbeatInterval !== 'number' || !Number.isFinite(cam.statusHeartbeatInterval) || cam.statusHeartbeatInterval < 0) {
+      throw new Error(`Camera '${cam.name}' has invalid statusHeartbeatInterval; expected a non-negative number (milliseconds)`);
+    }
+
     const snapshot = cam.snapshot;
     if (!snapshot) continue;
 
@@ -125,6 +129,15 @@ function validateSnapshotConfiguration(cameras: CameraConfig[]) {
 
       snapshot.onEvent.types = normalizedTypes as typeof snapshot.onEvent.types;
 
+      const rawMode = (snapshot.onEvent as { mode?: unknown }).mode;
+      const normalizedMode = rawMode === undefined
+        ? 'single'
+        : (typeof rawMode === 'string' ? rawMode.trim().toLowerCase() : '');
+      if (normalizedMode !== 'single' && normalizedMode !== 'continuous') {
+        throw new Error(`Camera '${cam.name}' has invalid snapshot.onEvent.mode; expected 'single' or 'continuous'`);
+      }
+      snapshot.onEvent.mode = normalizedMode;
+
       if (snapshot.onEvent.delay === undefined) {
         snapshot.onEvent.delay = 0;
       }
@@ -139,10 +152,6 @@ function validateSnapshotConfiguration(cameras: CameraConfig[]) {
       throw new Error(`Camera '${cam.name}' requires snapshot.address when snapshot interval or onEvent is configured`);
     }
     
-    // Validate statusHeartbeatInterval
-    if (typeof cam.statusHeartbeatInterval !== 'number' || !Number.isFinite(cam.statusHeartbeatInterval) || cam.statusHeartbeatInterval < 0) {
-      throw new Error(`Camera '${cam.name}' has invalid statusHeartbeatInterval; expected a non-negative number (milliseconds)`);
-    }
   }
 }
 
@@ -216,6 +225,7 @@ function normalizeCamera(name: string, entry: RawCameraEntry): CameraConfig {
     port,
     username: e.username as string | undefined,
     password: e.password as string | undefined,
+    statusHeartbeatInterval: e.statusHeartbeatInterval as number | undefined,
     snapshot: snapshotCfg as SnapshotConfig | undefined,
     eventDurations: (e.durations as Record<string, number>) || undefined,
   };

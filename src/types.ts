@@ -22,6 +22,7 @@ export type SnapshotTriggerType = 'motion' | 'line' | 'people' | 'vehicle' | 'an
 
 export interface SnapshotOnEventConfig {
   types: SnapshotTriggerType[];
+  mode?: 'single' | 'continuous';
   delay?: number; // milliseconds
 }
 

@@ -78,6 +78,20 @@ describe('Config loader normalization', () => {
     const cam = cfg.cameras.find(c => c.name === 'front-door');
     expect(cam?.snapshot?.interval).toBe(0);
     expect(cam?.snapshot?.onEvent?.delay).toBe(0);
+    expect(cam?.snapshot?.onEvent?.mode).toBe('single');
+  });
+
+  test('loads continuous snapshot.onEvent mode', () => {
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n    snapshot:\n      address: http://192.168.1.10/snap.jpg\n      onEvent:\n        types: [people]\n        mode: continuous\n`;
+    const p = writeTempYaml(yaml);
+    const cfg = loadConfig(p);
+    expect(cfg.cameras[0].snapshot?.onEvent?.mode).toBe('continuous');
+  });
+
+  test('rejects invalid snapshot.onEvent mode', () => {
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n    snapshot:\n      address: http://192.168.1.10/snap.jpg\n      onEvent:\n        types: [people]\n        mode: burst\n`;
+    const p = writeTempYaml(yaml);
+    expect(() => loadConfig(p)).toThrow("Camera 'front-door' has invalid snapshot.onEvent.mode");
   });
 
   test('throws when snapshot.onEvent uses boolean form', () => {

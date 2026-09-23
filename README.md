@@ -108,7 +108,7 @@ rateLimit:
 ```
 
 - `rateLimit` is a root-level setting and applies globally to all cameras.
-- Cooldown applies only to event-triggered snapshots (`snapshot.onEvent`), not periodic or manual command snapshots.
+- Cooldown applies to single-shot event snapshots, not periodic or manual command snapshots. Continuous event capture uses `snapshot.onEvent.delay` as its frame limiter instead.
 - During cooldown, event snapshots are ignored and logged at debug level.
 - `cooldownMs: 0` disables cooldown behavior.
 
@@ -128,6 +128,7 @@ cameras:
       address: "http://192.168.1.10/snapshot.jpg"
       onEvent:
         types: [motion]
+        mode: single
         delay: 0
       interval: 60000
     event:
@@ -146,9 +147,11 @@ cameras:
 - Snapshot retrieval uses `snapshot.address` as the source endpoint.
 - If `snapshot` is omitted for a camera, periodic and on-event snapshots are disabled for that camera.
 - `snapshot.interval` is in milliseconds and defaults to `0` when omitted (`0` means disabled).
-- `snapshot.onEvent` must be an object with required `types` and optional `delay` in milliseconds (default `0`).
+- `snapshot.onEvent` must be an object with required `types`, optional `mode` (default `single`), and optional `delay` in milliseconds (default `0`).
   - Valid `types`: `motion`, `line`, `people`, `vehicle`, `animal`, `all`
   - If `types` contains `all`, it must be the only value in the list.
+  - `mode: single` takes one snapshot per matching event, subject to the root `rateLimit` cooldown. This remains the default.
+  - `mode: continuous` captures repeatedly while any configured event type is active (`state: true`) and stops when all are inactive (`state: false`). `delay` limits the frame rate between capture starts; `0` adds no frame delay. Captures are serialized, and failed zero-delay attempts retry after one second. Continuous mode does not use the root `rateLimit` cooldown.
 - `snapshot.enabled` is not used by runtime and should be omitted.
 
 Snapshot credentials priority (applies to both `snapshot.type: url` and `snapshot.type: stream`):

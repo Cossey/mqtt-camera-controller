@@ -6,6 +6,7 @@ import { MQTTWrapper } from '../mqttClient';
 import { logInfo, logError, logDebug } from '../logger';
 
 const log = debug('camera');
+const CONTINUOUS_SNAPSHOT_RETRY_DELAY_MS = 1000;
 
 export class Camera {
   cfg: CameraConfig;
@@ -14,6 +15,11 @@ export class Camera {
   private lastEventChannelStatus: 'online' | 'offline' | null = null;
   private pendingOnEventSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
   private lastOnEventSnapshotAttemptAt = 0;
+  private activeSnapshotEventTypes = new Set<string>();
+  private continuousSnapshotLoopTask: Promise<void> | null = null;
+  private continuousSnapshotLoopGeneration = 0;
+  private continuousSnapshotDelayTimer: ReturnType<typeof setTimeout> | null = null;
+  private continuousSnapshotDelayResolver: (() => void) | null = null;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pullSubscription: { stop: () => void } | null = null;
   private unsubscribeSnapshotCommand: (() => void) | null = null;
@@ -83,7 +89,7 @@ export class Camera {
 
     const types = new Set(onEvent.types.map((t) => String(t).toLowerCase()));
     const delay = typeof onEvent.delay === 'number' && Number.isFinite(onEvent.delay) && onEvent.delay >= 0 ? onEvent.delay : 0;
-    return { types, delay };
+    return { types, delay, mode: onEvent.mode ?? 'single' };
   }
 
   private isOnEventSnapshotInCooldown(): boolean {
@@ -125,6 +131,73 @@ export class Camera {
       this.pendingOnEventSnapshotTimer = null;
       void this.takeSnapshotForEventTrigger();
     }, delayMs);
+  }
+
+  private waitForContinuousSnapshotLoop(delayMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      this.continuousSnapshotDelayResolver = resolve;
+      this.continuousSnapshotDelayTimer = setTimeout(() => {
+        this.continuousSnapshotDelayTimer = null;
+        this.continuousSnapshotDelayResolver = null;
+        resolve();
+      }, delayMs);
+    });
+  }
+
+  private stopContinuousSnapshotLoop() {
+    this.continuousSnapshotLoopGeneration += 1;
+    if (this.continuousSnapshotDelayTimer) {
+      clearTimeout(this.continuousSnapshotDelayTimer);
+      this.continuousSnapshotDelayTimer = null;
+    }
+    const resolveDelay = this.continuousSnapshotDelayResolver;
+    this.continuousSnapshotDelayResolver = null;
+    resolveDelay?.();
+  }
+
+  private startContinuousSnapshotLoop() {
+    if (this.continuousSnapshotLoopTask || this.activeSnapshotEventTypes.size === 0) return;
+
+    const generation = this.continuousSnapshotLoopGeneration;
+    let task: Promise<void>;
+    task = this.runContinuousSnapshotLoop(generation).finally(() => {
+      if (this.continuousSnapshotLoopTask === task) {
+        this.continuousSnapshotLoopTask = null;
+      }
+      if (this.activeSnapshotEventTypes.size > 0) {
+        this.startContinuousSnapshotLoop();
+      }
+    });
+    this.continuousSnapshotLoopTask = task;
+  }
+
+  private async runContinuousSnapshotLoop(generation: number) {
+    let lastFrameStartedAt: number | null = null;
+
+    while (generation === this.continuousSnapshotLoopGeneration && this.activeSnapshotEventTypes.size > 0) {
+      const settings = this.getOnEventSnapshotSettings();
+      if (!settings || settings.mode !== 'continuous') return;
+
+      const waitMs = lastFrameStartedAt === null
+        ? 0
+        : Math.max(0, settings.delay - (Date.now() - lastFrameStartedAt));
+      if (lastFrameStartedAt !== null && (waitMs > 0 || settings.delay === 0)) {
+        await this.waitForContinuousSnapshotLoop(waitMs);
+      }
+      if (generation !== this.continuousSnapshotLoopGeneration || this.activeSnapshotEventTypes.size === 0) return;
+
+      lastFrameStartedAt = Date.now();
+      try {
+        const snap = await this.getSnapshot();
+        if (generation !== this.continuousSnapshotLoopGeneration || this.activeSnapshotEventTypes.size === 0) return;
+        await this.publishSnapshot(snap);
+      } catch (err) {
+        logDebug(`[DEBUG] Continuous event snapshot failed camera=${this.cfg.name}: ${String(err)}`);
+        if (settings.delay === 0) {
+          await this.waitForContinuousSnapshotLoop(CONTINUOUS_SNAPSHOT_RETRY_DELAY_MS);
+        }
+      }
+    }
   }
 
   constructor(cfg: CameraConfig, mqtt: MQTTWrapper, rateLimit?: RateLimitConfig) {
@@ -210,6 +283,9 @@ export class Camera {
       clearTimeout(this.pendingOnEventSnapshotTimer);
       this.pendingOnEventSnapshotTimer = null;
     }
+
+    this.activeSnapshotEventTypes.clear();
+    this.stopContinuousSnapshotLoop();
 
     if (this.pullSubscription) {
       this.pullSubscription.stop();
@@ -330,7 +406,17 @@ export class Camera {
 
       if (onEventSettings) {
         if (onEventSettings.types.has('all') || onEventSettings.types.has(type)) {
-          shouldTriggerOnEventSnapshot = true;
+          if (onEventSettings.mode === 'continuous') {
+            if (state === true) {
+              this.activeSnapshotEventTypes.add(type);
+            } else if (state === false) {
+              this.activeSnapshotEventTypes.delete(type);
+            } else {
+              shouldTriggerOnEventSnapshot = true;
+            }
+          } else {
+            shouldTriggerOnEventSnapshot = true;
+          }
         }
       }
 
@@ -352,6 +438,14 @@ export class Camera {
           // no explicit state reported: emit ON (no scheduled OFF)
           this.mqtt.publish(topic, 'ON', { retain: true });
         }
+      }
+    }
+
+    if (onEventSettings?.mode === 'continuous') {
+      if (this.activeSnapshotEventTypes.size > 0) {
+        this.startContinuousSnapshotLoop();
+      } else {
+        this.stopContinuousSnapshotLoop();
       }
     }
 

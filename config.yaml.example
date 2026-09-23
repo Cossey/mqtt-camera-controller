@@ -35,7 +35,8 @@ cameras:
         # required when onEvent is specified. valid values: motion, line, people, vehicle, animal, all
         # when 'all' is used it must be the only value in this list.
         types: [motion, line]
-        delay: 0        # milliseconds; default 0
+        mode: single   # single (default) or continuous while a selected event is active
+        delay: 0        # milliseconds; in continuous mode this is the minimum frame interval; 0 = fastest
       # snapshot-specific credentials (preferred to use Docker secret files)
       # username: "user"
       # password_file: /run/secrets/frontdoor_snapshot_password

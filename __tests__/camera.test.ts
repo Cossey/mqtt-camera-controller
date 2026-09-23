@@ -124,6 +124,95 @@ describe('Camera onEvent snapshot behavior', () => {
     expect(publishSnapshotSpy).toHaveBeenCalledTimes(1);
   });
 
+  test('continuous mode captures while selected events are active and stops when they clear', async () => {
+    jest.useFakeTimers();
+    try {
+      const mqtt = {
+        publish: jest.fn(),
+        subscribe: jest.fn(),
+      } as any;
+
+      const cfg: CameraConfig = {
+        name: 'frontdoor',
+        snapshot: {
+          address: 'http://192.168.1.10/snap.jpg',
+          onEvent: {
+            types: ['people', 'motion'],
+            mode: 'continuous',
+            delay: 100,
+          },
+        },
+      };
+
+      const cam = new Camera(cfg, mqtt);
+      const getSnapshotSpy = jest.spyOn(cam, 'getSnapshot').mockResolvedValue(Buffer.from('image'));
+      const publishSnapshotSpy = jest.spyOn(cam, 'publishSnapshot').mockResolvedValue(undefined);
+
+      await cam.handleEvent({ type: 'people', state: true });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+      expect(publishSnapshotSpy).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(99);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(2);
+
+      await cam.handleEvent({ type: 'motion', state: true });
+      await cam.handleEvent({ type: 'people', state: false });
+      await jest.advanceTimersByTimeAsync(100);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(3);
+
+      await cam.handleEvent({ type: 'motion', state: false });
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(3);
+      await cam.stop();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('continuous mode with zero delay waits for each capture before starting the next', async () => {
+    jest.useFakeTimers();
+    try {
+      const mqtt = {
+        publish: jest.fn(),
+        subscribe: jest.fn(),
+      } as any;
+      const cfg: CameraConfig = {
+        name: 'frontdoor',
+        snapshot: {
+          address: 'http://192.168.1.10/snap.jpg',
+          onEvent: { types: ['people'], mode: 'continuous', delay: 0 },
+        },
+      };
+      const cam = new Camera(cfg, mqtt);
+      let finishCapture: (() => void) | undefined;
+      const getSnapshotSpy = jest.spyOn(cam, 'getSnapshot').mockImplementation(() => new Promise((resolve) => {
+        finishCapture = () => resolve(Buffer.from('image'));
+      }));
+      const publishSnapshotSpy = jest.spyOn(cam, 'publishSnapshot').mockResolvedValue(undefined);
+
+      await cam.handleEvent({ type: 'people', state: true });
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+      expect(publishSnapshotSpy).not.toHaveBeenCalled();
+
+      finishCapture?.();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(publishSnapshotSpy).toHaveBeenCalledTimes(1);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(2);
+
+      await cam.handleEvent({ type: 'people', state: false });
+      finishCapture?.();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(publishSnapshotSpy).toHaveBeenCalledTimes(1);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(2);
+      await cam.stop();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('coalesces delayed event snapshots to one pending snapshot per camera', async () => {
     jest.useFakeTimers();
     try {
