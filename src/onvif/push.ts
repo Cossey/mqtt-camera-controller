@@ -4,19 +4,14 @@ import http from 'http';
 import { CameraConfig, AppConfig } from '../types';
 import { CameraManager } from '../cameras/cameraManager';
 import { findEventTypesInObj } from './pullPoint';
-import { logError, logInfo, logWarn, logDebug } from '../logger';
+import { logError, logInfo, logWarn } from '../logger';
 import {
-  parseSecurityCapabilities,
   selectAuthMethods,
   logAuthCapabilities,
   logAuthStrategy,
-  logAuthAttempt,
   logAuthSuccess,
   logAuthFailure,
-  logAuthDowngrade,
-  logAuthExhausted,
   type SecurityCapabilities,
-  type AuthMethod,
 } from './authStrategy';
 
 const log = debug('push');

@@ -80,7 +80,7 @@ export function generateDigestAuthHeader(
   challenge: DigestChallenge,
   method: string,
   uri: string,
-  body?: string,
+  _body?: string,
 ): DigestAuthHeader {
   const algorithm = challenge.algorithm?.toUpperCase() || 'MD5';
   const username = cfg.username || '';
@@ -137,7 +137,7 @@ export async function fetchWithDigestAuth(
   url: string,
   init: { method?: string; headers?: Record<string, string>; body?: string },
   cfg: CameraConfig,
-  timeoutMs: number,
+  _timeoutMs: number,
 ): Promise<{ ok: boolean; status: number; text: () => Promise<string> }> {
   // First attempt without auth
   const method = init.method || 'GET';

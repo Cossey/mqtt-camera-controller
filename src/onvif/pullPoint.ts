@@ -5,18 +5,13 @@ import { CameraConfig, PullEndpointSelection } from '../types';
 import { logDebug, logError, logInfo, logWarn } from '../logger';
 import {
   parseSecurityCapabilities,
-  selectAuthMethods,
   logAuthCapabilities,
   logAuthStrategy,
-  logAuthAttempt,
   logAuthSuccess,
   logAuthFailure,
   logAuthDowngrade,
   logAuthExhausted,
-  type SecurityCapabilities,
-  type AuthMethod,
 } from './authStrategy';
-import { fetchWithDigestAuth } from './digestAuth';
 
 const log = debug('pullpoint');
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@', allowBooleanAttributes: true });

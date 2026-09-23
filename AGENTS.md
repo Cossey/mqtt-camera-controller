@@ -17,10 +17,11 @@ This file defines repository-specific guidance for coding agents working in this
 
 ## Build and Test
 
+- Lint: `npm run lint`
 - Run tests: `npm test -- --runInBand`
 - Build: `npm run build`
 
-Always run both after code changes when feasible.
+Always run lint, tests, and build after code changes when feasible. Lint uses `--max-warnings 0`, so warnings fail validation.
 
 ## Configuration Contracts
 

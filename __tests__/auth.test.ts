@@ -1,8 +1,7 @@
-import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import { describe, it, expect, beforeEach } from '@jest/globals';
 import {
   parseDigestChallenge,
   generateDigestAuthHeader,
-  fetchWithDigestAuth,
   type DigestChallenge,
 } from '../src/onvif/digestAuth';
 import {
@@ -139,27 +138,6 @@ describe('HTTP Digest Authentication', () => {
     });
   });
 
-  describe('fetchWithDigestAuth', () => {
-    let cfg: CameraConfig;
-
-    beforeEach(() => {
-      cfg = {
-        name: 'testcam',
-        host: '192.168.1.100',
-        port: 8080,
-        username: 'admin',
-        password: 'password',
-      };
-    });
-
-    it('would retry with digest auth on 401 challenge (integration test)', () => {
-      // Note: This is a placeholder test. Full integration testing would require
-      // mocking the fetch API which has complex typing with jest.
-      // In practice, the digestAuth functions are tested via unit tests above
-      // and via integration testing with real or mocked HTTP responses.
-      expect(true).toBe(true);
-    });
-  });
 });
 
 describe('ONVIF Security Capabilities Parsing', () => {

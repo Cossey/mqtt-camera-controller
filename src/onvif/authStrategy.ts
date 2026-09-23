@@ -16,6 +16,29 @@ export interface SecurityCapabilities {
 
 export type AuthMethod = 'wsse' | 'digest' | 'basic' | 'none';
 
+function findSecurityCaps(node: unknown): Record<string, unknown> | null {
+  if (!node || typeof node !== 'object') return null;
+
+  const obj = node as Record<string, unknown>;
+  for (const [key, value] of Object.entries(obj)) {
+    const normalizedKey = key.includes(':') ? key.split(':')[1] : key;
+    if (normalizedKey === 'Security' && typeof value === 'object') {
+      return value as Record<string, unknown>;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const result = findSecurityCaps(item);
+        if (result) return result;
+      }
+    } else if (typeof value === 'object') {
+      const result = findSecurityCaps(value);
+      if (result) return result;
+    }
+  }
+  return null;
+}
+
 /**
  * Parse security capabilities from ONVIF GetCapabilities response.
  * Extracts UsernameToken, HttpDigest, TLS versions, and hashing algorithms.
@@ -32,33 +55,6 @@ export function parseSecurityCapabilities(parsedXml: unknown): SecurityCapabilit
   try {
     // Navigate parsed XML to Security capabilities
     const rec = parsedXml as Record<string, unknown>;
-
-    // Collect all nested nodes to search for Security/CapabilityCategory
-    function findSecurityCaps(node: unknown): Record<string, unknown> | null {
-      if (!node || typeof node !== 'object') return null;
-
-      const obj = node as Record<string, unknown>;
-      for (const [k, v] of Object.entries(obj)) {
-        const key = k.includes(':') ? k.split(':')[1] : k;
-
-        // Found Security node
-        if (key === 'Security' && typeof v === 'object') {
-          return v as Record<string, unknown>;
-        }
-
-        // Recurse into children
-        if (Array.isArray(v)) {
-          for (const item of v) {
-            const result = findSecurityCaps(item);
-            if (result) return result;
-          }
-        } else if (typeof v === 'object') {
-          const result = findSecurityCaps(v);
-          if (result) return result;
-        }
-      }
-      return null;
-    }
 
     const securityNode = findSecurityCaps(rec);
     if (securityNode) {
@@ -154,7 +150,7 @@ export function selectAuthMethods(
 export function logAuthCapabilities(
   cameraName: string,
   caps: SecurityCapabilities,
-  isHttpsUrl: boolean,
+  _isHttpsUrl: boolean,
 ): void {
   const capsList = [];
   if (caps.usernameToken) capsList.push('UsernameToken');

@@ -159,8 +159,7 @@ export class Camera {
     if (this.continuousSnapshotLoopTask || this.activeSnapshotEventTypes.size === 0) return;
 
     const generation = this.continuousSnapshotLoopGeneration;
-    let task: Promise<void>;
-    task = this.runContinuousSnapshotLoop(generation).finally(() => {
+    const task = this.runContinuousSnapshotLoop(generation).finally(() => {
       if (this.continuousSnapshotLoopTask === task) {
         this.continuousSnapshotLoopTask = null;
       }
