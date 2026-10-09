@@ -71,14 +71,28 @@ describe('Config loader normalization', () => {
     expect(() => loadConfig(p)).toThrow("Camera 'garage' requires a valid numeric 'port' for ONVIF pull mode");
   });
 
-  test('defaults snapshot.interval and snapshot.onEvent.delay to 0 when omitted', () => {
+  test('defaults snapshot interval and onEvent delays to 0 when omitted', () => {
     const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n    snapshot:\n      address: http://192.168.1.10/snap.jpg\n      onEvent:\n        types: [motion]\n`;
     const p = writeTempYaml(yaml);
     const cfg = loadConfig(p);
     const cam = cfg.cameras.find(c => c.name === 'front-door');
     expect(cam?.snapshot?.interval).toBe(0);
     expect(cam?.snapshot?.onEvent?.delay).toBe(0);
+    expect(cam?.snapshot?.onEvent?.stopDelay).toBe(0);
     expect(cam?.snapshot?.onEvent?.mode).toBe('single');
+  });
+
+  test('loads snapshot.onEvent.stopDelay in milliseconds', () => {
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n    snapshot:\n      address: http://192.168.1.10/snap.jpg\n      onEvent:\n        types: [motion]\n        stopDelay: 5000\n`;
+    const p = writeTempYaml(yaml);
+    const cfg = loadConfig(p);
+    expect(cfg.cameras[0].snapshot?.onEvent?.stopDelay).toBe(5000);
+  });
+
+  test('rejects a negative snapshot.onEvent.stopDelay', () => {
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n    snapshot:\n      address: http://192.168.1.10/snap.jpg\n      onEvent:\n        types: [motion]\n        stopDelay: -1\n`;
+    const p = writeTempYaml(yaml);
+    expect(() => loadConfig(p)).toThrow("Camera 'front-door' has invalid snapshot.onEvent.stopDelay");
   });
 
   test('loads continuous snapshot.onEvent mode', () => {

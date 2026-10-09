@@ -24,6 +24,7 @@ export interface SnapshotOnEventConfig {
   types: SnapshotTriggerType[];
   mode?: 'single' | 'continuous';
   delay?: number; // milliseconds
+  stopDelay?: number; // milliseconds to continue after all selected events clear
 }
 
 export interface RateLimitConfig {

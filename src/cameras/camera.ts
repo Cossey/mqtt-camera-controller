@@ -12,6 +12,14 @@ export class Camera {
   cfg: CameraConfig;
   mqtt: MQTTWrapper;
   private rateLimit: RateLimitConfig;
+  private stopped = false;
+  private snapshotCaptureQueue: Array<() => void> = [];
+  private snapshotCaptureInProgress = false;
+  private lastSnapshotCompletedAt: number | null = null;
+  private snapshotIntervalWaitTimer: ReturnType<typeof setTimeout> | null = null;
+  private snapshotIntervalWaitResolver: (() => void) | null = null;
+  private continuousSnapshotIntervalWaitCancel: (() => void) | null = null;
+  private periodicSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
   private lastEventChannelStatus: 'online' | 'offline' | null = null;
   private pendingOnEventSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
   private lastOnEventSnapshotAttemptAt = 0;
@@ -20,6 +28,7 @@ export class Camera {
   private continuousSnapshotLoopGeneration = 0;
   private continuousSnapshotDelayTimer: ReturnType<typeof setTimeout> | null = null;
   private continuousSnapshotDelayResolver: (() => void) | null = null;
+  private continuousSnapshotStopTimer: ReturnType<typeof setTimeout> | null = null;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pullSubscription: { stop: () => void } | null = null;
   private unsubscribeSnapshotCommand: (() => void) | null = null;
@@ -89,7 +98,8 @@ export class Camera {
 
     const types = new Set(onEvent.types.map((t) => String(t).toLowerCase()));
     const delay = typeof onEvent.delay === 'number' && Number.isFinite(onEvent.delay) && onEvent.delay >= 0 ? onEvent.delay : 0;
-    return { types, delay, mode: onEvent.mode ?? 'single' };
+    const stopDelay = typeof onEvent.stopDelay === 'number' && Number.isFinite(onEvent.stopDelay) && onEvent.stopDelay >= 0 ? onEvent.stopDelay : 0;
+    return { types, delay, stopDelay, mode: onEvent.mode ?? 'single' };
   }
 
   private isOnEventSnapshotInCooldown(): boolean {
@@ -109,8 +119,7 @@ export class Camera {
     this.lastOnEventSnapshotAttemptAt = Date.now();
 
     try {
-      const snap = await this.getSnapshot();
-      await this.publishSnapshot(snap);
+      await this.captureAndPublishSnapshot();
     } catch (err) {
       log('snapshot on event failed', err);
     }
@@ -133,6 +142,87 @@ export class Camera {
     }, delayMs);
   }
 
+  private waitForSnapshotInterval(delayMs: number, cancelWhenContinuousStops: boolean): Promise<void> {
+    return new Promise((resolve) => {
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        if (this.snapshotIntervalWaitTimer) clearTimeout(this.snapshotIntervalWaitTimer);
+        this.snapshotIntervalWaitTimer = null;
+        this.snapshotIntervalWaitResolver = null;
+        if (this.continuousSnapshotIntervalWaitCancel === finish) {
+          this.continuousSnapshotIntervalWaitCancel = null;
+        }
+        resolve();
+      };
+      this.snapshotIntervalWaitResolver = finish;
+      if (cancelWhenContinuousStops) this.continuousSnapshotIntervalWaitCancel = finish;
+      this.snapshotIntervalWaitTimer = setTimeout(finish, delayMs);
+    });
+  }
+
+  private async runSnapshotCapture(shouldCapture: () => boolean, onCaptureStarted?: () => void, cancelIntervalWaitOnStop = false): Promise<void> {
+    if (this.stopped || !shouldCapture()) return;
+
+    const interval = this.cfg.snapshot?.interval ?? 0;
+    if (interval > 0 && this.lastSnapshotCompletedAt !== null) {
+      const remainingMs = interval - (Date.now() - this.lastSnapshotCompletedAt);
+      if (remainingMs > 0) await this.waitForSnapshotInterval(remainingMs, cancelIntervalWaitOnStop);
+    }
+
+    if (this.stopped || !shouldCapture()) return;
+    onCaptureStarted?.();
+    const image = await this.getSnapshot();
+    if (this.stopped || !shouldCapture()) return;
+    await this.publishSnapshot(image);
+  }
+
+  private captureAndPublishSnapshot(
+    shouldCapture: () => boolean = () => true,
+    onCaptureStarted?: () => void,
+    cancelIntervalWaitOnStop = false,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const run = () => {
+        if (this.stopped) {
+          resolve();
+          return;
+        }
+
+        this.snapshotCaptureInProgress = true;
+        void this.runSnapshotCapture(shouldCapture, onCaptureStarted, cancelIntervalWaitOnStop).then(
+          () => {
+            this.snapshotCaptureInProgress = false;
+            resolve();
+            this.snapshotCaptureQueue.shift()?.();
+          },
+          (err: unknown) => {
+            this.snapshotCaptureInProgress = false;
+            reject(err);
+            this.snapshotCaptureQueue.shift()?.();
+          },
+        );
+      };
+
+      if (this.snapshotCaptureInProgress) this.snapshotCaptureQueue.push(run);
+      else run();
+    });
+  }
+
+  startPeriodicSnapshotLoop() {
+    if (this.stopped || this.periodicSnapshotTimer || (this.cfg.snapshot?.interval ?? 0) <= 0) return;
+
+    this.periodicSnapshotTimer = setTimeout(() => {
+      this.periodicSnapshotTimer = null;
+      if (this.stopped) return;
+
+      void this.captureAndPublishSnapshot()
+        .catch((err) => log('periodic snapshot failed', this.cfg.name, err))
+        .finally(() => this.startPeriodicSnapshotLoop());
+    }, this.cfg.snapshot?.interval);
+  }
+
   private waitForContinuousSnapshotLoop(delayMs: number): Promise<void> {
     return new Promise((resolve) => {
       this.continuousSnapshotDelayResolver = resolve;
@@ -146,6 +236,13 @@ export class Camera {
 
   private stopContinuousSnapshotLoop() {
     this.continuousSnapshotLoopGeneration += 1;
+    const cancelSnapshotIntervalWait = this.continuousSnapshotIntervalWaitCancel;
+    this.continuousSnapshotIntervalWaitCancel = null;
+    cancelSnapshotIntervalWait?.();
+    if (this.continuousSnapshotStopTimer) {
+      clearTimeout(this.continuousSnapshotStopTimer);
+      this.continuousSnapshotStopTimer = null;
+    }
     if (this.continuousSnapshotDelayTimer) {
       clearTimeout(this.continuousSnapshotDelayTimer);
       this.continuousSnapshotDelayTimer = null;
@@ -155,8 +252,31 @@ export class Camera {
     resolveDelay?.();
   }
 
+  private scheduleContinuousSnapshotLoopStop(delayMs: number) {
+    if (!this.continuousSnapshotLoopTask || this.continuousSnapshotStopTimer) return;
+    if (delayMs <= 0) {
+      this.stopContinuousSnapshotLoop();
+      return;
+    }
+
+    this.continuousSnapshotStopTimer = setTimeout(() => {
+      this.continuousSnapshotStopTimer = null;
+      if (this.activeSnapshotEventTypes.size === 0) this.stopContinuousSnapshotLoop();
+    }, delayMs);
+  }
+
+  private shouldContinueContinuousSnapshotLoop(generation: number) {
+    return generation === this.continuousSnapshotLoopGeneration
+      && (this.activeSnapshotEventTypes.size > 0 || this.continuousSnapshotStopTimer !== null);
+  }
+
   private startContinuousSnapshotLoop() {
-    if (this.continuousSnapshotLoopTask || this.activeSnapshotEventTypes.size === 0) return;
+    if (this.activeSnapshotEventTypes.size === 0) return;
+    if (this.continuousSnapshotStopTimer) {
+      clearTimeout(this.continuousSnapshotStopTimer);
+      this.continuousSnapshotStopTimer = null;
+    }
+    if (this.continuousSnapshotLoopTask) return;
 
     const generation = this.continuousSnapshotLoopGeneration;
     const task = this.runContinuousSnapshotLoop(generation).finally(() => {
@@ -173,7 +293,7 @@ export class Camera {
   private async runContinuousSnapshotLoop(generation: number) {
     let lastFrameStartedAt: number | null = null;
 
-    while (generation === this.continuousSnapshotLoopGeneration && this.activeSnapshotEventTypes.size > 0) {
+    while (this.shouldContinueContinuousSnapshotLoop(generation)) {
       const settings = this.getOnEventSnapshotSettings();
       if (!settings || settings.mode !== 'continuous') return;
 
@@ -183,13 +303,14 @@ export class Camera {
       if (lastFrameStartedAt !== null && (waitMs > 0 || settings.delay === 0)) {
         await this.waitForContinuousSnapshotLoop(waitMs);
       }
-      if (generation !== this.continuousSnapshotLoopGeneration || this.activeSnapshotEventTypes.size === 0) return;
+      if (!this.shouldContinueContinuousSnapshotLoop(generation)) return;
 
-      lastFrameStartedAt = Date.now();
       try {
-        const snap = await this.getSnapshot();
-        if (generation !== this.continuousSnapshotLoopGeneration || this.activeSnapshotEventTypes.size === 0) return;
-        await this.publishSnapshot(snap);
+        await this.captureAndPublishSnapshot(
+          () => this.shouldContinueContinuousSnapshotLoop(generation),
+          () => { lastFrameStartedAt = Date.now(); },
+          true,
+        );
       } catch (err) {
         logDebug(`[DEBUG] Continuous event snapshot failed camera=${this.cfg.name}: ${String(err)}`);
         if (settings.delay === 0) {
@@ -232,8 +353,7 @@ export class Camera {
 
       log('snapshot command for', this.cfg.name);
       try {
-        const snap = await this.getSnapshot();
-        await this.publishSnapshot(snap);
+        await this.captureAndPublishSnapshot();
       } catch (err) {
         log('snapshot error', err);
       }
@@ -278,6 +398,20 @@ export class Camera {
   }
 
   async stop() {
+    this.stopped = true;
+    if (this.periodicSnapshotTimer) {
+      clearTimeout(this.periodicSnapshotTimer);
+      this.periodicSnapshotTimer = null;
+    }
+    if (this.snapshotIntervalWaitTimer) {
+      clearTimeout(this.snapshotIntervalWaitTimer);
+      this.snapshotIntervalWaitTimer = null;
+    }
+    const resolveSnapshotIntervalWait = this.snapshotIntervalWaitResolver;
+    this.snapshotIntervalWaitResolver = null;
+    resolveSnapshotIntervalWait?.();
+    while (this.snapshotCaptureQueue.length > 0) this.snapshotCaptureQueue.shift()?.();
+
     if (this.pendingOnEventSnapshotTimer) {
       clearTimeout(this.pendingOnEventSnapshotTimer);
       this.pendingOnEventSnapshotTimer = null;
@@ -368,6 +502,7 @@ export class Camera {
   async publishSnapshot(img: Buffer) {
     // Publish a raw image buffer (no JSON wrapper) to the image topic
     this.mqtt.publish(`${this.cfg.name}/image`, img);
+    this.lastSnapshotCompletedAt = Date.now();
   }
 
   normalizeEventType(raw: string) {
@@ -444,7 +579,7 @@ export class Camera {
       if (this.activeSnapshotEventTypes.size > 0) {
         this.startContinuousSnapshotLoop();
       } else {
-        this.stopContinuousSnapshotLoop();
+        this.scheduleContinuousSnapshotLoopStop(onEventSettings.stopDelay);
       }
     }
 

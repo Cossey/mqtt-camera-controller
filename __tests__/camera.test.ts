@@ -172,6 +172,69 @@ describe('Camera onEvent snapshot behavior', () => {
     }
   });
 
+  test('continuous mode keeps capturing until stopDelay expires', async () => {
+    jest.useFakeTimers();
+    try {
+      const mqtt = { publish: jest.fn(), subscribe: jest.fn() } as any;
+      const cam = new Camera({
+        name: 'frontdoor',
+        snapshot: {
+          address: 'http://192.168.1.10/snap.jpg',
+          onEvent: { types: ['motion'], mode: 'continuous', delay: 100, stopDelay: 250 },
+        },
+      }, mqtt);
+      const getSnapshotSpy = jest.spyOn(cam, 'getSnapshot').mockResolvedValue(Buffer.from('image'));
+
+      await cam.handleEvent({ type: 'motion', state: true });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+
+      await cam.handleEvent({ type: 'motion', state: false });
+      await jest.advanceTimersByTimeAsync(249);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(3);
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(3);
+      await cam.stop();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('renewed activity cancels a pending continuous stopDelay', async () => {
+    jest.useFakeTimers();
+    try {
+      const mqtt = { publish: jest.fn(), subscribe: jest.fn() } as any;
+      const cam = new Camera({
+        name: 'frontdoor',
+        snapshot: {
+          address: 'http://192.168.1.10/snap.jpg',
+          onEvent: { types: ['motion'], mode: 'continuous', delay: 100, stopDelay: 250 },
+        },
+      }, mqtt);
+      const getSnapshotSpy = jest.spyOn(cam, 'getSnapshot').mockResolvedValue(Buffer.from('image'));
+
+      await cam.handleEvent({ type: 'motion', state: true });
+      await jest.advanceTimersByTimeAsync(0);
+      await cam.handleEvent({ type: 'motion', state: false });
+      await jest.advanceTimersByTimeAsync(100);
+      await cam.handleEvent({ type: 'motion', state: true });
+      await jest.advanceTimersByTimeAsync(100);
+      await cam.handleEvent({ type: 'motion', state: false });
+      await jest.advanceTimersByTimeAsync(50);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(3);
+      await jest.advanceTimersByTimeAsync(199);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(5);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(5);
+
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(5);
+      await cam.stop();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('continuous mode with zero delay waits for each capture before starting the next', async () => {
     jest.useFakeTimers();
     try {
@@ -325,6 +388,8 @@ describe('Camera onEvent snapshot behavior', () => {
   });
 
   test('allows all event snapshots when cooldownMs is 0', async () => {
+    jest.useFakeTimers();
+    try {
     const mqtt = {
       publish: jest.fn(),
       subscribe: jest.fn(),
@@ -346,7 +411,63 @@ describe('Camera onEvent snapshot behavior', () => {
 
     await cam.handleEvent({ type: 'motion', state: true });
     await cam.handleEvent({ type: 'motion', state: true });
+    expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(0);
     expect(getSnapshotSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('spaces manual and onEvent snapshots from the last completed update', async () => {
+    jest.useFakeTimers();
+    try {
+      let commandHandler: ((topic: string, message: Buffer) => Promise<void>) | undefined;
+      const mqtt = {
+        publish: jest.fn(),
+        subscribe: jest.fn((_topic: string, handler: (topic: string, message: Buffer) => Promise<void>) => {
+          commandHandler = handler;
+          return jest.fn();
+        }),
+      } as any;
+      const cam = new Camera({
+        name: 'frontdoor',
+        snapshot: {
+          address: 'http://192.168.1.10/snap.jpg',
+          interval: 100,
+          onEvent: { types: ['motion'], delay: 0 },
+        },
+        event: { mode: 'push' },
+      }, mqtt, { enabled: true, cooldownMs: 0 });
+      let finishManualCapture: (() => void) | undefined;
+      const getSnapshotSpy = jest.spyOn(cam, 'getSnapshot')
+        .mockImplementationOnce(() => new Promise((resolve) => {
+          finishManualCapture = () => resolve(Buffer.from('manual'));
+        }))
+        .mockResolvedValue(Buffer.from('event'));
+      const publishSnapshotSpy = jest.spyOn(cam, 'publishSnapshot');
+
+      await cam.init();
+      const manualRequest = commandHandler?.('frontdoor/command', Buffer.from('snapshot'));
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+
+      await cam.handleEvent({ type: 'motion', state: true });
+      finishManualCapture?.();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(publishSnapshotSpy).toHaveBeenCalledTimes(1);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(99);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(getSnapshotSpy).toHaveBeenCalledTimes(2);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(publishSnapshotSpy).toHaveBeenCalledTimes(2);
+      await manualRequest;
+      await cam.stop();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 
@@ -498,13 +619,12 @@ describe('CameraManager startup baselines', () => {
     }
   });
 
-  test('uses snapshot.interval as milliseconds for periodic snapshots', async () => {
+  test('schedules periodic snapshots after the previous capture completes', async () => {
+    jest.useFakeTimers();
     const mqtt = {
       publish: jest.fn(),
       subscribe: jest.fn(),
     } as any;
-
-    const setIntervalSpy = jest.spyOn(global, 'setInterval');
 
     try {
       const manager = new CameraManager({
@@ -525,13 +645,30 @@ describe('CameraManager startup baselines', () => {
 
       try {
         await manager.init();
+        const camera = manager.cameras[0];
+        let finishFirstCapture: (() => void) | undefined;
+        const getSnapshotSpy = jest.spyOn(camera, 'getSnapshot')
+          .mockImplementationOnce(() => new Promise((resolve) => {
+            finishFirstCapture = () => resolve(Buffer.from('image'));
+          }))
+          .mockResolvedValue(Buffer.from('image'));
 
-        expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 250);
+        await jest.advanceTimersByTimeAsync(250);
+        expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+
+        finishFirstCapture?.();
+        await jest.advanceTimersByTimeAsync(0);
+        await jest.advanceTimersByTimeAsync(249);
+        expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+        await jest.advanceTimersByTimeAsync(1);
+        expect(getSnapshotSpy).toHaveBeenCalledTimes(2);
       } finally {
         await manager.stop();
       }
     } finally {
-      setIntervalSpy.mockRestore();
+      jest.useRealTimers();
     }
   });
 });

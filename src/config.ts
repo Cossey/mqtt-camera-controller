@@ -145,6 +145,14 @@ function validateSnapshotConfiguration(cameras: CameraConfig[]) {
       if (typeof snapshot.onEvent.delay !== 'number' || !Number.isFinite(snapshot.onEvent.delay) || snapshot.onEvent.delay < 0) {
         throw new Error(`Camera '${cam.name}' has invalid snapshot.onEvent.delay; expected a non-negative number (milliseconds)`);
       }
+
+      if (snapshot.onEvent.stopDelay === undefined) {
+        snapshot.onEvent.stopDelay = 0;
+      }
+
+      if (typeof snapshot.onEvent.stopDelay !== 'number' || !Number.isFinite(snapshot.onEvent.stopDelay) || snapshot.onEvent.stopDelay < 0) {
+        throw new Error(`Camera '${cam.name}' has invalid snapshot.onEvent.stopDelay; expected a non-negative number (milliseconds)`);
+      }
     }
 
     const hasActiveSnapshotTrigger = snapshot.interval > 0 || snapshot.onEvent !== undefined;
@@ -241,6 +249,10 @@ function normalizeCamera(name: string, entry: RawCameraEntry): CameraConfig {
 
   if (cfg.snapshot?.onEvent && typeof cfg.snapshot.onEvent === 'object' && cfg.snapshot.onEvent.delay === undefined) {
     cfg.snapshot.onEvent.delay = 0;
+  }
+
+  if (cfg.snapshot?.onEvent && typeof cfg.snapshot.onEvent === 'object' && cfg.snapshot.onEvent.stopDelay === undefined) {
+    cfg.snapshot.onEvent.stopDelay = 0;
   }
 
   // Normalize statusHeartbeatInterval
