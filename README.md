@@ -299,6 +299,23 @@ ONVIF request strategy is secure-first:
 - Lint: `npm run lint`
 - Build: `npm run build`
 
+## Publishing the Docker image
+
+The `Publish Docker Image` workflow (`.github/workflows/docker-publish.yml`) is manual only. Run it from the Actions tab; it builds and pushes to Docker Hub. It does not run on push or pull request, so the regular CI workflow is unaffected.
+
+Configure the repository once under **Settings > Secrets and variables > Actions**:
+
+| Type | Name | Purpose |
+| --- | --- | --- |
+| Variable | `DOCKERHUB_USERNAME` | Docker Hub namespace that owns the repository |
+| Variable | `DOCKER_IMAGE_NAME` | Image name; optional, defaults to `mqtt-camera-controller` |
+| Secret | `DOCKERHUB_USERNAME` | Docker Hub username |
+| Secret | `DOCKERHUB_TOKEN` | Docker Hub access token (Account > Personal access tokens) |
+
+Each run pushes two tags: `latest` and the short commit SHA. Use the SHA to pin a deployment, and `latest` for the most recent successful publish. An optional `platforms` input overrides the build target; it defaults to `linux/amd64`, and accepts a comma-separated list such as `linux/amd64,linux/arm64`.
+
+The workflow fails fast with an annotated error if the variable or secrets are missing, rather than pushing to a wrong or partial tag set.
+
 ## License
 
 BSD 3-Clause. See `LICENSE`.
