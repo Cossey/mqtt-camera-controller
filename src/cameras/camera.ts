@@ -3,22 +3,25 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import { CameraConfig, RateLimitConfig } from '../types';
 import { MQTTWrapper } from '../mqttClient';
-import { logInfo, logError, logDebug } from '../logger';
+import { logInfo, logError, logWarn, logDebug } from '../logger';
+import { DEFAULT_SNAPSHOT_TIMEOUT_MS } from '../config';
 
 const log = debug('camera');
 const CONTINUOUS_SNAPSHOT_RETRY_DELAY_MS = 1000;
+// Upper bound on captures waiting behind an in-flight one. A newer request supersedes
+// the oldest pending one so a slow camera cannot build an unbounded backlog.
+const MAX_PENDING_SNAPSHOT_CAPTURES = 8;
 
 export class Camera {
   cfg: CameraConfig;
   mqtt: MQTTWrapper;
   private rateLimit: RateLimitConfig;
   private stopped = false;
-  private snapshotCaptureQueue: Array<() => void> = [];
+  private snapshotCaptureQueue: Array<{ start: () => void; drop: () => void }> = [];
   private snapshotCaptureInProgress = false;
   private lastSnapshotCompletedAt: number | null = null;
   private snapshotIntervalWaitTimer: ReturnType<typeof setTimeout> | null = null;
   private snapshotIntervalWaitResolver: (() => void) | null = null;
-  private continuousSnapshotIntervalWaitCancel: (() => void) | null = null;
   private periodicSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
   private lastEventChannelStatus: 'online' | 'offline' | null = null;
   private pendingOnEventSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
@@ -110,6 +113,12 @@ export class Camera {
     return elapsedMs < cooldownMs;
   }
 
+  private get snapshotCaptureTimeoutMs(): number {
+    const configured = this.cfg.snapshot?.timeout;
+    if (typeof configured === 'number' && Number.isFinite(configured) && configured >= 0) return configured;
+    return DEFAULT_SNAPSHOT_TIMEOUT_MS;
+  }
+
   private async takeSnapshotForEventTrigger() {
     if (this.isOnEventSnapshotInCooldown()) {
       logDebug(`[DEBUG] Event snapshot skipped due to cooldown camera=${this.cfg.name}`);
@@ -142,7 +151,7 @@ export class Camera {
     }, delayMs);
   }
 
-  private waitForSnapshotInterval(delayMs: number, cancelWhenContinuousStops: boolean): Promise<void> {
+  private waitForSnapshotInterval(delayMs: number): Promise<void> {
     return new Promise((resolve) => {
       let finished = false;
       const finish = () => {
@@ -151,26 +160,24 @@ export class Camera {
         if (this.snapshotIntervalWaitTimer) clearTimeout(this.snapshotIntervalWaitTimer);
         this.snapshotIntervalWaitTimer = null;
         this.snapshotIntervalWaitResolver = null;
-        if (this.continuousSnapshotIntervalWaitCancel === finish) {
-          this.continuousSnapshotIntervalWaitCancel = null;
-        }
         resolve();
       };
       this.snapshotIntervalWaitResolver = finish;
-      if (cancelWhenContinuousStops) this.continuousSnapshotIntervalWaitCancel = finish;
       this.snapshotIntervalWaitTimer = setTimeout(finish, delayMs);
     });
   }
 
-  private async runSnapshotCapture(shouldCapture: () => boolean, onCaptureStarted?: () => void, cancelIntervalWaitOnStop = false): Promise<void> {
-    if (this.stopped || !shouldCapture()) return;
-
-    const interval = this.cfg.snapshot?.interval ?? 0;
-    if (interval > 0 && this.lastSnapshotCompletedAt !== null) {
+  // The periodic interval only paces periodic refresh. On-event and manual snapshots are
+  // never delayed by it, so this waits outside the shared capture path.
+  private async waitForPeriodicInterval(interval: number): Promise<void> {
+    while (!this.stopped && this.lastSnapshotCompletedAt !== null) {
       const remainingMs = interval - (Date.now() - this.lastSnapshotCompletedAt);
-      if (remainingMs > 0) await this.waitForSnapshotInterval(remainingMs, cancelIntervalWaitOnStop);
+      if (remainingMs <= 0) return;
+      await this.waitForSnapshotInterval(remainingMs);
     }
+  }
 
+  private async runSnapshotCapture(shouldCapture: () => boolean, onCaptureStarted?: () => void): Promise<void> {
     if (this.stopped || !shouldCapture()) return;
     onCaptureStarted?.();
     const image = await this.getSnapshot();
@@ -181,46 +188,59 @@ export class Camera {
   private captureAndPublishSnapshot(
     shouldCapture: () => boolean = () => true,
     onCaptureStarted?: () => void,
-    cancelIntervalWaitOnStop = false,
   ): Promise<void> {
     return new Promise((resolve, reject) => {
-      const run = () => {
+      const start = () => {
         if (this.stopped) {
           resolve();
           return;
         }
 
         this.snapshotCaptureInProgress = true;
-        void this.runSnapshotCapture(shouldCapture, onCaptureStarted, cancelIntervalWaitOnStop).then(
+        void this.runSnapshotCapture(shouldCapture, onCaptureStarted).then(
           () => {
             this.snapshotCaptureInProgress = false;
             resolve();
-            this.snapshotCaptureQueue.shift()?.();
+            this.snapshotCaptureQueue.shift()?.start();
           },
           (err: unknown) => {
             this.snapshotCaptureInProgress = false;
             reject(err);
-            this.snapshotCaptureQueue.shift()?.();
+            this.snapshotCaptureQueue.shift()?.start();
           },
         );
       };
 
-      if (this.snapshotCaptureInProgress) this.snapshotCaptureQueue.push(run);
-      else run();
+      if (!this.snapshotCaptureInProgress) {
+        start();
+        return;
+      }
+
+      // Keep the newest requests: a superseded capture resolves without publishing so its
+      // caller (for example the periodic loop) still gets to schedule its next run.
+      while (this.snapshotCaptureQueue.length >= MAX_PENDING_SNAPSHOT_CAPTURES) {
+        this.snapshotCaptureQueue.shift()?.drop();
+        logDebug(`[DEBUG] Snapshot capture backlog truncated camera=${this.cfg.name} limit=${MAX_PENDING_SNAPSHOT_CAPTURES}`);
+      }
+      this.snapshotCaptureQueue.push({ start, drop: () => resolve() });
     });
   }
 
   startPeriodicSnapshotLoop() {
-    if (this.stopped || this.periodicSnapshotTimer || (this.cfg.snapshot?.interval ?? 0) <= 0) return;
+    const interval = this.cfg.snapshot?.interval ?? 0;
+    if (this.stopped || this.periodicSnapshotTimer || interval <= 0) return;
 
     this.periodicSnapshotTimer = setTimeout(() => {
       this.periodicSnapshotTimer = null;
       if (this.stopped) return;
 
-      void this.captureAndPublishSnapshot()
+      // Enforced here rather than in the shared capture path so interval never delays
+      // snapshots requested over MQTT or triggered by an event.
+      void this.waitForPeriodicInterval(interval)
+        .then(() => this.captureAndPublishSnapshot())
         .catch((err) => log('periodic snapshot failed', this.cfg.name, err))
         .finally(() => this.startPeriodicSnapshotLoop());
-    }, this.cfg.snapshot?.interval);
+    }, interval);
   }
 
   private waitForContinuousSnapshotLoop(delayMs: number): Promise<void> {
@@ -236,9 +256,6 @@ export class Camera {
 
   private stopContinuousSnapshotLoop() {
     this.continuousSnapshotLoopGeneration += 1;
-    const cancelSnapshotIntervalWait = this.continuousSnapshotIntervalWaitCancel;
-    this.continuousSnapshotIntervalWaitCancel = null;
-    cancelSnapshotIntervalWait?.();
     if (this.continuousSnapshotStopTimer) {
       clearTimeout(this.continuousSnapshotStopTimer);
       this.continuousSnapshotStopTimer = null;
@@ -309,7 +326,6 @@ export class Camera {
         await this.captureAndPublishSnapshot(
           () => this.shouldContinueContinuousSnapshotLoop(generation),
           () => { lastFrameStartedAt = Date.now(); },
-          true,
         );
       } catch (err) {
         logDebug(`[DEBUG] Continuous event snapshot failed camera=${this.cfg.name}: ${String(err)}`);
@@ -410,7 +426,7 @@ export class Camera {
     const resolveSnapshotIntervalWait = this.snapshotIntervalWaitResolver;
     this.snapshotIntervalWaitResolver = null;
     resolveSnapshotIntervalWait?.();
-    while (this.snapshotCaptureQueue.length > 0) this.snapshotCaptureQueue.shift()?.();
+    while (this.snapshotCaptureQueue.length > 0) this.snapshotCaptureQueue.shift()?.drop();
 
     if (this.pendingOnEventSnapshotTimer) {
       clearTimeout(this.pendingOnEventSnapshotTimer);
@@ -458,13 +474,35 @@ export class Camera {
         const ff = spawn('ffmpeg', args);
         const chunks: Buffer[] = [];
         let stderr = '';
+        const timeoutMs = this.snapshotCaptureTimeoutMs;
+        let settled = false;
+        // Kill ffmpeg if the camera never hands over a frame, otherwise the serialized
+        // capture lane for this camera stays blocked forever.
+        const killTimer = timeoutMs > 0
+          ? setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            logWarn(`[WARN] Stream snapshot timed out camera=${this.cfg.name} timeoutMs=${timeoutMs}`);
+            ff.kill('SIGKILL');
+            reject(new Error(`ffmpeg snapshot timed out after ${timeoutMs}ms`));
+          }, timeoutMs)
+          : null;
+        const settle = (finish: () => void) => {
+          if (settled) return;
+          settled = true;
+          if (killTimer) clearTimeout(killTimer);
+          finish();
+        };
+
         ff.stdout.on('data', (c: Buffer) => chunks.push(c));
         ff.stderr.on('data', (c: Buffer) => { stderr += c.toString(); });
         ff.on('close', (code: number | null) => {
-          if (code === 0 && chunks.length > 0) resolve(Buffer.concat(chunks));
-          else reject(new Error(`ffmpeg failed: code=${code} ${this.redactCredentials(stderr)}`));
+          settle(() => {
+            if (code === 0 && chunks.length > 0) resolve(Buffer.concat(chunks));
+            else reject(new Error(`ffmpeg failed: code=${code} ${this.redactCredentials(stderr)}`));
+          });
         });
-        ff.on('error', (err: Error) => reject(err));
+        ff.on('error', (err: Error) => settle(() => reject(err)));
       });
     }
 
@@ -482,12 +520,27 @@ export class Camera {
         headers.Authorization = `Basic ${token}`;
       }
 
-      interface SimpleRequestInit { method?: string; headers?: Record<string,string>; body?: string }
+      interface SimpleRequestInit { method?: string; headers?: Record<string,string>; body?: string; signal?: AbortSignal }
       const init: SimpleRequestInit = { headers };
-      const res = await fetcher(addr, init as SimpleRequestInit);
-      if (!res.ok) throw new Error(`Snapshot fetch failed ${res.status}`);
-      const ab = await res.arrayBuffer();
-      return Buffer.from(ab);
+
+      // Abort the request when the camera stalls so the capture lane is never blocked forever.
+      const timeoutMs = this.snapshotCaptureTimeoutMs;
+      const controller = new AbortController();
+      const abortTimer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
+      try {
+        const res = await fetcher(addr, { ...init, signal: controller.signal } as SimpleRequestInit);
+        if (!res.ok) throw new Error(`Snapshot fetch failed ${res.status}`);
+        const ab = await res.arrayBuffer();
+        return Buffer.from(ab);
+      } catch (err) {
+        if (controller.signal.aborted) {
+          logWarn(`[WARN] Snapshot fetch timed out camera=${this.cfg.name} timeoutMs=${timeoutMs}`);
+          throw new Error(`Snapshot fetch timed out after ${timeoutMs}ms`);
+        }
+        throw err;
+      } finally {
+        if (abortTimer) clearTimeout(abortTimer);
+      }
     }
 
     throw new Error('No snapshot configuration available (address)');

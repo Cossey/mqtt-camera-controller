@@ -4,6 +4,7 @@ import YAML from 'yaml';
 import { AppConfig, CameraConfig, RawCameraEntry, MqttConfig, SnapshotConfig, LogLevelName, HomeAssistantConfig, RateLimitConfig } from './types';
 
 const VALID_SNAPSHOT_EVENT_TYPES = ['motion', 'line', 'people', 'vehicle', 'animal', 'all'] as const;
+export const DEFAULT_SNAPSHOT_TIMEOUT_MS = 15000;
 
 function normalizeBoolean(value: unknown, defaultValue: boolean, fieldName: string): boolean {
   if (value === undefined) return defaultValue;
@@ -105,6 +106,14 @@ function validateSnapshotConfiguration(cameras: CameraConfig[]) {
 
     if (typeof snapshot.interval !== 'number' || !Number.isFinite(snapshot.interval) || snapshot.interval < 0) {
       throw new Error(`Camera '${cam.name}' has invalid snapshot.interval; expected a non-negative number (milliseconds)`);
+    }
+
+    if (snapshot.timeout === undefined) {
+      snapshot.timeout = DEFAULT_SNAPSHOT_TIMEOUT_MS;
+    }
+
+    if (typeof snapshot.timeout !== 'number' || !Number.isFinite(snapshot.timeout) || snapshot.timeout < 0) {
+      throw new Error(`Camera '${cam.name}' has invalid snapshot.timeout; expected a non-negative number (milliseconds)`);
     }
 
     if (snapshot.onEvent !== undefined) {

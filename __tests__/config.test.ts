@@ -102,6 +102,20 @@ describe('Config loader normalization', () => {
     expect(cfg.cameras[0].snapshot?.onEvent?.mode).toBe('continuous');
   });
 
+  test('defaults snapshot.timeout when omitted and keeps an explicit value', () => {
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n    snapshot:\n      address: http://192.168.1.10/snap.jpg\n      interval: 60000\n  back-door:\n    host: 192.168.1.12\n    port: 80\n    snapshot:\n      address: http://192.168.1.12/snap.jpg\n      interval: 60000\n      timeout: 30000\n`;
+    const p = writeTempYaml(yaml);
+    const cfg = loadConfig(p);
+    expect(cfg.cameras.find(c => c.name === 'front-door')?.snapshot?.timeout).toBe(15000);
+    expect(cfg.cameras.find(c => c.name === 'back-door')?.snapshot?.timeout).toBe(30000);
+  });
+
+  test('rejects invalid snapshot.timeout', () => {
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n    snapshot:\n      address: http://192.168.1.10/snap.jpg\n      interval: 60000\n      timeout: -1\n`;
+    const p = writeTempYaml(yaml);
+    expect(() => loadConfig(p)).toThrow("Camera 'front-door' has invalid snapshot.timeout");
+  });
+
   test('rejects invalid snapshot.onEvent mode', () => {
     const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n    snapshot:\n      address: http://192.168.1.10/snap.jpg\n      onEvent:\n        types: [people]\n        mode: burst\n`;
     const p = writeTempYaml(yaml);

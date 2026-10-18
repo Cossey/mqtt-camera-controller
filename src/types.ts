@@ -35,6 +35,9 @@ export interface RateLimitConfig {
 export interface SnapshotConfig {
   enabled?: boolean;
   interval?: number; // milliseconds
+  // hard limit for a single capture attempt (milliseconds); 0 disables the timeout.
+  // Prevents one unresponsive camera from blocking its own snapshot pipeline.
+  timeout?: number;
   onEvent?: SnapshotOnEventConfig;
   // snapshot type: 'url' to fetch HTTP snapshot, 'stream' to grab a frame via ffmpeg from a stream
   type?: 'url' | 'stream';

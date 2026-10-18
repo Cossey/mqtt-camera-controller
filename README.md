@@ -109,7 +109,7 @@ rateLimit:
 
 - `rateLimit` is a root-level setting and applies globally to all cameras.
 - Cooldown applies to single-shot event snapshots, not periodic or manual command snapshots. Continuous event capture uses `snapshot.onEvent.delay` as its frame limiter instead.
-- Snapshot captures are serialized per camera. When `snapshot.interval` is greater than zero, it is the minimum time from completion of one successful snapshot update to the start of the next, including periodic, manual, and on-event snapshots. Completion means the image was handed to the local MQTT client, not acknowledged by the broker.
+- Snapshot captures are serialized per camera, so only one capture per camera is in flight at a time. Serialization applies across all triggers, but `snapshot.interval` paces periodic refresh only and never delays a snapshot requested over MQTT or triggered by an event. Completion means the image was handed to the local MQTT client, not acknowledged by the broker.
 - During cooldown, event snapshots are ignored and logged at debug level.
 - `cooldownMs: 0` disables cooldown behavior.
 
@@ -133,6 +133,8 @@ cameras:
         delay: 0
         stopDelay: 5000
       interval: 60000
+      timeout: 15000
+      # interval paces periodic refresh only; MQTT and on-event snapshots ignore it
     event:
       mode: pull
       pull:
@@ -148,7 +150,10 @@ cameras:
   - `configured`: always force configured host/port
 - Snapshot retrieval uses `snapshot.address` as the source endpoint.
 - If `snapshot` is omitted for a camera, periodic and on-event snapshots are disabled for that camera.
-- `snapshot.interval` is in milliseconds and defaults to `0` when omitted. A positive value sets the minimum gap from the last completed successful snapshot update to the next capture, regardless of whether the update was periodic, manual, or on-event. Snapshot captures are serialized per camera; periodic refresh is disabled when `interval` is `0`.
+- `snapshot.interval` is in milliseconds and defaults to `0` when omitted. A positive value paces periodic refresh: the next periodic capture waits until `interval` has passed since the last completed snapshot update, whichever trigger produced it. It is a minimum gap for periodic refresh only and is not applied to snapshots requested over MQTT or triggered by `snapshot.onEvent`, which capture as soon as the per-camera capture lane is free. Periodic refresh is disabled when `interval` is `0`.
+- Continuous capture is paced by `snapshot.onEvent.delay` and does not consult `snapshot.interval`.
+- `snapshot.timeout` is in milliseconds and defaults to `15000`. It bounds a single capture attempt: an unresponsive HTTP snapshot is aborted and a hung `ffmpeg` grab is killed, so one unresponsive camera cannot block its own snapshot pipeline. `0` disables the timeout. A timeout is logged at warn level and counts as a failed attempt for the cooldown. The bound applies per camera, so a stalled camera never blocks other cameras.
+- While a capture is in flight, further requests queue up to eight deep. A newer request supersedes the oldest pending one, which is settled without publishing, so a slow camera cannot build an unbounded backlog.
 - `snapshot.onEvent` must be an object with required `types`, optional `mode` (default `single`), and optional `delay` and `stopDelay` in milliseconds (both default `0`). `delay` controls continuous frame pacing. `stopDelay` keeps continuous capture active for the specified time after all selected events clear; a selected event becoming active again cancels the pending stop.
   - Valid `types`: `motion`, `line`, `people`, `vehicle`, `animal`, `all`
   - If `types` contains `all`, it must be the only value in the list.
