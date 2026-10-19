@@ -39,6 +39,10 @@ export class CameraManager {
         continue;
       }
 
+      // Start periodic snapshots right after init succeeds. Push auto-subscribe below
+      // can bail out early; periodic snapshots must not depend on its outcome.
+      cam.startPeriodicSnapshotLoop();
+
       // if push mode and autoSubscribe configured, try to ask camera to POST to our notify endpoint
       try {
         if (camCfg.event?.mode === 'push' && camCfg.event?.push?.autoSubscribe) {
@@ -73,8 +77,6 @@ export class CameraManager {
         logError(`[ERROR] Push auto-subscribe error camera=${camCfg.name}`, err);
         log('autoSubscribe push error', err);
       }
-
-      cam.startPeriodicSnapshotLoop();
     }
 
     if (typeof (this.mqtt as unknown as { publishRaw?: unknown }).publishRaw === 'function') {

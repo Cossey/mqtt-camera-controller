@@ -308,6 +308,60 @@ describe('PullPoint event parsing', () => {
     }
   });
 
+  test('recovers when camera is unreachable at startup', async () => {
+    let callIndex = 0;
+    const fetchMock = jest.fn(async (url: string) => {
+      callIndex += 1;
+      // Startup discovery fails while the camera is still offline (e.g. after a power cut).
+      if (callIndex === 1) throw new Error('connect EHOSTUNREACH 192.168.50.202:2020');
+
+      if (url.endsWith('/onvif/device_service')) {
+        return mockResponse(true, 200, SOAP_CAPABILITIES_WITH_EVENTS_XADDR);
+      }
+
+      if (url.includes(':1024/event-1024_1024') && !url.includes('/sub-1')) {
+        return mockResponse(true, 200, SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS);
+      }
+
+      return mockResponse(true, 200, SOAP_PULL_MESSAGES_OK);
+    });
+
+    const originalFetch = (globalThis as unknown as { fetch?: unknown }).fetch;
+    (globalThis as unknown as { fetch?: unknown }).fetch = fetchMock;
+
+    const onHealthy = jest.fn();
+    const onError = jest.fn();
+
+    try {
+      // Must not reject: an unreachable camera at startup is retried by the pull loop.
+      const controller = await startPullPoint(
+        {
+          name: 'gate',
+          host: '192.168.50.202',
+          port: 2020,
+        },
+        () => undefined,
+        {
+          onHealthy,
+          onError,
+          pollIntervalMs: 50,
+        }
+      );
+
+      await wait(300);
+      controller.stop();
+
+      expect(onError).toHaveBeenCalled();
+      expect(onHealthy).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/sub-1'),
+        expect.anything()
+      );
+    } finally {
+      (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
+    }
+  });
+
   test('reports unhealthy when pull polling fails after being healthy', async () => {
     let callIndex = 0;
     const fetchMock = jest.fn(async () => {

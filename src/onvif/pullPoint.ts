@@ -1133,7 +1133,15 @@ export async function startPullPoint(
     await recoverSubscription('renew failed');
   };
 
-  await establishSubscription('startup');
+  try {
+    await establishSubscription('startup');
+  } catch (err) {
+    // The camera may be unreachable at startup (e.g. still booting after a power loss).
+    // This is not fatal: the pull loop below retries via recoverSubscription until the
+    // camera becomes reachable, then polling resumes and onHealthy fires.
+    logWarn(`[WARN] PullPoint startup subscription failed; will retry in pull loop camera=${cfg.name}`, err);
+    hooks?.onError?.(err);
+  }
 
   (async () => {
     while (!stopped) {

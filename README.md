@@ -241,6 +241,7 @@ Pull mode (default):
 - Polls camera PullPoint endpoint for events
 - Endpoint source policy is controlled by `event.pull.endpointSelection` (`auto` by default)
 - Camera status transitions to `ONLINE` only after healthy pull activity
+- Self-healing: if a camera is unreachable at startup (e.g. still booting after a power loss) or drops mid-run, the app retries in the background with backoff and resumes automatically once the camera returns; no container restart is needed
 
 Push mode (optional):
 

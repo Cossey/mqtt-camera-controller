@@ -959,6 +959,42 @@ describe('CameraManager startup baselines', () => {
     }
   });
 
+  test('keeps pull camera registered when it is unreachable at startup', async () => {
+    const mqtt = {
+      publish: jest.fn(),
+      subscribe: jest.fn(),
+    } as any;
+
+    const originalFetch = (globalThis as unknown as { fetch?: unknown }).fetch;
+    (globalThis as unknown as { fetch?: unknown }).fetch = jest.fn(async () => {
+      throw new Error('connect EHOSTUNREACH 192.168.1.20:80');
+    });
+
+    const manager = new CameraManager({
+      mqtt: { server: 'example.com' },
+      cameras: [
+        {
+          name: 'driveway',
+          host: '192.168.1.20',
+          port: 80,
+          event: { mode: 'pull' },
+        },
+      ],
+    } as any, mqtt);
+
+    try {
+      await manager.init();
+
+      // The camera stays registered so the pull loop can recover once it becomes
+      // reachable again, instead of requiring a container restart.
+      expect(manager.cameras).toHaveLength(1);
+      expect(manager.getCameraByName('driveway')).toBeTruthy();
+    } finally {
+      await manager.stop();
+      (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
+    }
+  });
+
   test('schedules periodic snapshots after the previous capture completes', async () => {
     jest.useFakeTimers();
     const mqtt = {
