@@ -12,12 +12,13 @@ import {
   logAuthDowngrade,
   logAuthExhausted,
 } from './authStrategy';
+import { buildDigestRetryInit, parseDigestChallenge, warnDigestOverHttpOnce } from './digestAuth';
 
 const log = debug('pullpoint');
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@', allowBooleanAttributes: true });
 const PULL_SUBSCRIPTION_TERMINATION = 'PT24H';
 const PULL_FAILURES_BEFORE_RESUBSCRIBE = 3;
-const PULL_REQUEST_TIMEOUT_MS = 5000;
+export const PULL_REQUEST_TIMEOUT_MS = 5000;
 const MIN_RENEW_DELAY_MS = 1000;
 const MIN_RESUBSCRIBE_DELAY_MS = 1000;
 const PULL_STALE_GRACE_MS = 2000;
@@ -51,7 +52,7 @@ function toBoolOrUndefined(value: unknown): boolean | undefined {
   return undefined;
 }
 
-function redactUrl(raw: string): string {
+export function redactUrl(raw: string): string {
   try {
     const u = new URL(raw);
     if (u.username || u.password) {
@@ -94,7 +95,7 @@ function buildWsseSecurityHeader(cfg: CameraConfig): string {
     </wsse:Security>`;
 }
 
-function buildSoapEnvelope(bodyInnerXml: string, cfg: CameraConfig, useWsse: boolean): string {
+export function buildSoapEnvelope(bodyInnerXml: string, cfg: CameraConfig, useWsse: boolean): string {
   const security = useWsse ? buildWsseSecurityHeader(cfg) : '';
   const header = security ? `<s:Header>${security}</s:Header>` : '';
 
@@ -270,7 +271,7 @@ function pickBestEventXaddr(candidates: string[]): string | null {
   return candidates[0] || null;
 }
 
-function soapFaultSummary(xml: string): string | null {
+export function soapFaultSummary(xml: string): string | null {
   try {
     const parsed = parser.parse(xml) as Record<string, unknown>;
     const faultNodes: unknown[] = [];
@@ -316,7 +317,7 @@ function resolveMaybeRelativeUrl(urlOrPath: string, baseUrl: string): string {
   }
 }
 
-function extractSubscriptionAddressFromResponse(parsed: unknown, baseUrl: string): string | null {
+export function extractSubscriptionAddressFromResponse(parsed: unknown, baseUrl: string): string | null {
   // Preferred: CreatePullPointSubscriptionResponse -> SubscriptionReference -> Address
   const responseNodes: unknown[] = [];
   collectAllByLocalName(parsed, 'CreatePullPointSubscriptionResponse', responseNodes);
@@ -377,14 +378,14 @@ function parseIsoDateMs(value: string | null): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function extractSubscriptionTimingFromResponse(parsed: unknown, responseLocalName: string): { currentTimeMs: number | null; terminationTimeMs: number | null } {
+export function extractSubscriptionTimingFromResponse(parsed: unknown, responseLocalName: string): { currentTimeMs: number | null; terminationTimeMs: number | null } {
   return {
     currentTimeMs: parseIsoDateMs(extractResponseDateValue(parsed, responseLocalName, 'CurrentTime')),
     terminationTimeMs: parseIsoDateMs(extractResponseDateValue(parsed, responseLocalName, 'TerminationTime')),
   };
 }
 
-function computeRenewDelayMs(currentTimeMs: number | null, terminationTimeMs: number | null): number | null {
+export function computeRenewDelayMs(currentTimeMs: number | null, terminationTimeMs: number | null): number | null {
   if (!terminationTimeMs) return null;
 
   const baselineMs = currentTimeMs ?? Date.now();
@@ -506,12 +507,32 @@ function staleThresholdMs(pollIntervalMs: number, requestTimeoutMs: number): num
   return Math.max(requestTimeoutMs + pollIntervalMs + PULL_STALE_GRACE_MS, pollIntervalMs * 3);
 }
 
-async function fetchWithTimeout(
+function headersToRecord(headers: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!headers || typeof headers !== 'object') return out;
+
+  // Real fetch responses expose a Headers object with forEach; plain-object test
+  // mocks fall through to the entries walk below.
+  const forEach = (headers as { forEach?: (cb: (value: unknown, key: string) => void) => void }).forEach;
+  if (typeof forEach === 'function') {
+    forEach.call(headers, (value: unknown, key: string) => {
+      if (typeof value === 'string') out[key.toLowerCase()] = value;
+    });
+    return out;
+  }
+
+  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+    if (typeof value === 'string') out[key.toLowerCase()] = value;
+  }
+  return out;
+}
+
+export async function fetchWithTimeout(
   fetcher: typeof fetch,
   url: string,
   init: { method?: string; headers?: Record<string,string>; body?: string },
   timeoutMs: number
-): Promise<{ ok: boolean; status: number; text: () => Promise<string> }> {
+): Promise<{ ok: boolean; status: number; text: () => Promise<string>; headers: Record<string, string> }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
 
@@ -524,10 +545,10 @@ async function fetchWithTimeout(
       headers?: Record<string,string>;
       body?: string;
       signal: AbortSignal;
-    }) as { ok: boolean; status: number; text: () => Promise<string> };
+    }) as { ok: boolean; status: number; text: () => Promise<string>; headers?: unknown };
     // Body read must stay under the same deadline; the abort signal above only covers headers.
     const bodyText = await resp.text();
-    return { ok: resp.ok, status: resp.status, text: () => Promise.resolve(bodyText) };
+    return { ok: resp.ok, status: resp.status, text: () => Promise.resolve(bodyText), headers: headersToRecord(resp.headers) };
   } finally {
     clearTimeout(timer);
   }
@@ -611,6 +632,31 @@ export async function getEventsXaddr(cfg: CameraConfig, requestTimeoutMs = PULL_
 
       if (!basicResp.ok || basicFault) {
         logAuthFailure(cfg.name, 'basic', basicResp.status, basicFault);
+
+        // Digest retry: some cameras challenge with 401 + WWW-Authenticate: Digest only.
+        const digestInit = buildDigestRetryInit(basicInit, cfg, basicResp.headers['www-authenticate'] ?? '', url);
+        if (digestInit) {
+          warnDigestOverHttpOnce(cfg.name, url);
+          try {
+            const digestResp = await fetchWithTimeout(fetcher, url, digestInit, requestTimeoutMs);
+            const digestTxt = await digestResp.text();
+            const digestFault = soapFaultSummary(digestTxt);
+            if (digestResp.ok && !digestFault) {
+              const digestParsed = parseCandidates(digestTxt);
+              if (digestParsed.selected) {
+                const selected = applyEventsXaddrSelection(digestParsed.selected, cfg);
+                logAuthSuccess(cfg.name, 'digest');
+                logDebug(`[DEBUG] GetCapabilities connected using Digest auth camera=${cfg.name}`);
+                return selected;
+              }
+              return null;
+            }
+            logDebug(`[DEBUG] GetCapabilities Digest attempt failed camera=${cfg.name} status=${digestResp.status} fault=${digestFault || 'n/a'}`);
+          } catch (err) {
+            logDebug(`[DEBUG] GetCapabilities Digest attempt error camera=${cfg.name}`, err);
+          }
+        }
+
         logAuthExhausted(cfg.name, ['wsse', 'basic'], basicResp.status);
         logError(`[ERROR] GetCapabilities failed camera=${cfg.name} url=${redactUrl(url)} status=${basicResp.status} fault=${basicFault || 'n/a'} body=${basicTxt.slice(0, 300)}`);
         return null;
@@ -701,6 +747,9 @@ async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfi
         ];
 
     const attemptFailures: string[] = [];
+    // Most recent 401 Digest challenge seen across attempts; used for a single final
+    // digest attempt after the endpoint/variant loops are exhausted (bounded attempt count).
+    let digestChallenge: { url: string; source: 'camera' | 'configured'; wwwAuth: string } | null = null;
 
     for (const endpoint of endpointCandidates) {
       const endpointUrl = endpoint.url;
@@ -727,7 +776,7 @@ async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfi
           const init = { method: 'POST', headers, body };
           const attempt = `${variant.name}/${req.name}`;
 
-          let r: { ok: boolean; status: number; text: () => Promise<string> };
+          let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
           try {
             r = await fetchWithTimeout(fetcher, endpointUrl, init as { method?: string; headers?: Record<string,string>; body?: string }, requestTimeoutMs);
           } catch (err) {
@@ -744,6 +793,13 @@ async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfi
             const msg = `variant=${attempt} status=${r.status} fault=${fault || 'n/a'}`;
             attemptFailures.push(msg);
             logDebug(`[DEBUG] CreatePullPointSubscription attempt failed camera=${cfg.name} url=${redactUrl(endpointUrl)} ${msg}`);
+
+            if (r.status === 401) {
+              const wwwAuth = r.headers['www-authenticate'];
+              if (wwwAuth && parseDigestChallenge(wwwAuth)) {
+                digestChallenge = { url: endpointUrl, source: endpoint.source, wwwAuth };
+              }
+            }
             continue;
           }
 
@@ -783,6 +839,44 @@ async function createPullPointSubscription(eventsXaddr: string, cfg: CameraConfi
             currentTimeMs: timing.currentTimeMs,
             terminationTimeMs: timing.terminationTimeMs,
           };
+        }
+      }
+    }
+
+    // One final digest attempt after the endpoint/variant loops are exhausted: a single
+    // request against the endpoint that issued the last Digest challenge (first header
+    // variant, with-termination body) so digest-only cameras can still subscribe.
+    if (digestChallenge) {
+      const digestInit = buildDigestRetryInit(
+        { method: 'POST', headers: { ...headerVariants[0].headers }, body: buildSoapEnvelope(bodyWithTermination, cfg, false) },
+        cfg,
+        digestChallenge.wwwAuth,
+        digestChallenge.url,
+      );
+      if (digestInit) {
+        warnDigestOverHttpOnce(cfg.name, digestChallenge.url);
+        try {
+          const r = await fetchWithTimeout(fetcher, digestChallenge.url, digestInit, requestTimeoutMs);
+          const txt = await r.text();
+          if (r.ok && !soapFaultSummary(txt)) {
+            const obj = parser.parse(txt);
+            const addr = extractSubscriptionAddressFromResponse(obj, digestChallenge.url);
+            const timing = extractSubscriptionTimingFromResponse(obj, 'CreatePullPointSubscriptionResponse');
+            const finalAddr = addr
+              ? (digestChallenge.source === 'configured'
+                ? pinUrlToConfiguredEndpoint(addr, cfg, 'PullPoint subscription address')
+                : addr)
+              : digestChallenge.url;
+            logDebug(`[DEBUG] CreatePullPointSubscription connected using Digest auth camera=${cfg.name} url=${redactUrl(digestChallenge.url)}`);
+            return {
+              address: finalAddr,
+              currentTimeMs: timing.currentTimeMs,
+              terminationTimeMs: timing.terminationTimeMs,
+            };
+          }
+          logDebug(`[DEBUG] CreatePullPointSubscription Digest attempt failed camera=${cfg.name} status=${r.status} body=${txt.slice(0, 300)}`);
+        } catch (err) {
+          logDebug(`[DEBUG] CreatePullPointSubscription Digest attempt error camera=${cfg.name}`, err);
         }
       }
     }
@@ -831,6 +925,8 @@ async function renewPullPointSubscription(subAddr: string, cfg: CameraConfig, re
         { name: 'basic', useWsse: false },
       ];
 
+  let digestChallenge: string | null = null;
+
   try {
     const fetcher = (globalThis as unknown as { fetch?: typeof fetch }).fetch;
     if (!fetcher) throw new Error('Global fetch is not available');
@@ -853,7 +949,7 @@ async function renewPullPointSubscription(subAddr: string, cfg: CameraConfig, re
         const init = { method: 'POST', headers, body };
         const attempt = `${variant.name}/${req.name}`;
 
-        let response: { ok: boolean; status: number; text: () => Promise<string> };
+        let response: Awaited<ReturnType<typeof fetchWithTimeout>>;
         try {
           response = await fetchWithTimeout(fetcher, subAddr, init as { method?: string; headers?: Record<string,string>; body?: string }, requestTimeoutMs);
         } catch (err) {
@@ -869,6 +965,13 @@ async function renewPullPointSubscription(subAddr: string, cfg: CameraConfig, re
           const msg = `variant=${attempt} status=${response.status} fault=${fault || 'n/a'}`;
           attemptFailures.push(msg);
           logDebug(`[DEBUG] RenewPullPointSubscription attempt failed camera=${cfg.name} url=${redactUrl(subAddr)} ${msg}`);
+
+          if (response.status === 401) {
+            const wwwAuth = response.headers['www-authenticate'];
+            if (wwwAuth && parseDigestChallenge(wwwAuth)) {
+              digestChallenge = wwwAuth;
+            }
+          }
           continue;
         }
 
@@ -894,6 +997,33 @@ async function renewPullPointSubscription(subAddr: string, cfg: CameraConfig, re
           currentTimeMs: timing.currentTimeMs,
           terminationTimeMs: null,
         };
+      }
+    }
+
+    // One final digest attempt after the variants are exhausted (single request,
+    // first header variant) so digest-only cameras can still renew.
+    if (digestChallenge) {
+      const digestInit = buildDigestRetryInit(
+        { method: 'POST', headers: { ...headerVariants[0].headers }, body: buildSoapEnvelope(bodyInner, cfg, false) },
+        cfg,
+        digestChallenge,
+        subAddr,
+      );
+      if (digestInit) {
+        warnDigestOverHttpOnce(cfg.name, subAddr);
+        try {
+          const response = await fetchWithTimeout(fetcher, subAddr, digestInit, requestTimeoutMs);
+          const txt = await response.text();
+          if (response.ok && !soapFaultSummary(txt)) {
+            const obj = parser.parse(txt);
+            const timing = extractSubscriptionTimingFromResponse(obj, 'RenewResponse');
+            logDebug(`[DEBUG] RenewPullPointSubscription connected using Digest auth camera=${cfg.name}`);
+            return timing;
+          }
+          logDebug(`[DEBUG] RenewPullPointSubscription Digest attempt failed camera=${cfg.name} status=${response.status} body=${txt.slice(0, 300)}`);
+        } catch (err) {
+          logDebug(`[DEBUG] RenewPullPointSubscription Digest attempt error camera=${cfg.name}`, err);
+        }
       }
     }
 
@@ -942,6 +1072,24 @@ async function pullMessagesOnce(subAddr: string, cfg: CameraConfig, requestTimeo
       const basicTxt = await basicResp.text();
       const basicFault = soapFaultSummary(basicTxt);
       if (!basicResp.ok || basicFault) {
+        // Digest retry: some cameras challenge with 401 + WWW-Authenticate: Digest only.
+        const digestInit = buildDigestRetryInit(basicInit, cfg, basicResp.headers['www-authenticate'] ?? '', subAddr);
+        if (digestInit) {
+          warnDigestOverHttpOnce(cfg.name, subAddr);
+          try {
+            const digestResp = await fetchWithTimeout(fetcher, subAddr, digestInit, requestTimeoutMs);
+            const digestTxt = await digestResp.text();
+            const digestFault = soapFaultSummary(digestTxt);
+            if (digestResp.ok && !digestFault) {
+              logDebug(`[DEBUG] PullMessages connected using Digest auth camera=${cfg.name} url=${redactUrl(subAddr)}`);
+              return digestTxt;
+            }
+            logDebug(`[DEBUG] PullMessages Digest attempt failed camera=${cfg.name} status=${digestResp.status} fault=${digestFault || 'n/a'}`);
+          } catch (err) {
+            logDebug(`[DEBUG] PullMessages Digest attempt error camera=${cfg.name}`, err);
+          }
+        }
+
         logError(`[ERROR] PullMessages failed camera=${cfg.name} url=${redactUrl(subAddr)} status=${basicResp.status} fault=${basicFault || 'n/a'} body=${basicTxt.slice(0, 300)}`);
         return null;
       }

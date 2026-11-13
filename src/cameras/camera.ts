@@ -5,12 +5,15 @@ import { CameraConfig, RateLimitConfig } from '../types';
 import { MQTTWrapper } from '../mqttClient';
 import { logInfo, logError, logWarn, logDebug } from '../logger';
 import { DEFAULT_SNAPSHOT_TIMEOUT_MS } from '../config';
+import { buildDigestRetryInit, warnDigestOverHttpOnce } from '../onvif/digestAuth';
 
 const log = debug('camera');
 const CONTINUOUS_SNAPSHOT_RETRY_DELAY_MS = 1000;
 // Upper bound on captures waiting behind an in-flight one. A newer request supersedes
 // the oldest pending one so a slow camera cannot build an unbounded backlog.
 const MAX_PENDING_SNAPSHOT_CAPTURES = 8;
+
+interface SimpleRequestInit { method?: string; headers?: Record<string,string>; body?: string; signal?: AbortSignal }
 
 export class Camera {
   cfg: CameraConfig;
@@ -449,6 +452,55 @@ export class Camera {
     this.lastOnEventSnapshotAttemptAt = 0;
   }
 
+  private readWwwAuthenticateHeader(res: { headers?: unknown }): string {
+    const headers = res.headers as { get?: (name: string) => string | null } | undefined;
+    if (headers && typeof headers.get === 'function') {
+      return headers.get('WWW-Authenticate') || headers.get('www-authenticate') || '';
+    }
+    if (headers && typeof headers === 'object') {
+      for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+        if (key.toLowerCase() === 'www-authenticate' && typeof value === 'string') return value;
+      }
+    }
+    return '';
+  }
+
+  // One-shot Digest retry: some cameras challenge with 401 + WWW-Authenticate: Digest
+  // even though Basic credentials were provided. Re-issues the identical fetch with a
+  // computed Digest Authorization header under the same abort deadline. Returns null
+  // when the response is not a Digest challenge or the retry also fails.
+  private async trySnapshotDigestRetry(
+    addr: string,
+    headers: Record<string, string>,
+    username: string | undefined,
+    password: string | undefined,
+    res: { status: number; headers?: unknown },
+    signal: AbortSignal | undefined,
+  ): Promise<{ ok: boolean; status: number; arrayBuffer: () => Promise<ArrayBuffer> } | null> {
+    if (res.status !== 401 || !username || !password) return null;
+
+    const wwwAuth = this.readWwwAuthenticateHeader(res);
+    const digestInit = buildDigestRetryInit({ headers }, { ...this.cfg, username, password }, wwwAuth, addr);
+    if (!digestInit) return null;
+
+    warnDigestOverHttpOnce(this.cfg.name, addr);
+
+    try {
+      const fetcher = (globalThis as unknown as { fetch?: typeof fetch }).fetch;
+      if (!fetcher) return null;
+      const retry = await fetcher(addr, { method: 'GET', headers: digestInit.headers, signal } as SimpleRequestInit);
+      if (retry.ok) {
+        logInfo(`[INFO] Digest auth used camera=${this.cfg.name}`);
+        return retry as { ok: boolean; status: number; arrayBuffer: () => Promise<ArrayBuffer> };
+      }
+      logDebug(`[DEBUG] Snapshot Digest retry failed camera=${this.cfg.name} status=${retry.status}`);
+      return null;
+    } catch (err) {
+      logDebug(`[DEBUG] Snapshot Digest retry error camera=${this.cfg.name}`, err);
+      return null;
+    }
+  }
+
   async getSnapshot(): Promise<Buffer> {
     // Determine snapshot behavior: prefer explicit snapshot.type; address is in snapshot.address
     const snapshot = this.cfg.snapshot;
@@ -520,7 +572,6 @@ export class Camera {
         headers.Authorization = `Basic ${token}`;
       }
 
-      interface SimpleRequestInit { method?: string; headers?: Record<string,string>; body?: string; signal?: AbortSignal }
       const init: SimpleRequestInit = { headers };
 
       // Abort the request when the camera stalls so the capture lane is never blocked forever.
@@ -529,7 +580,12 @@ export class Camera {
       const abortTimer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
       try {
         const res = await fetcher(addr, { ...init, signal: controller.signal } as SimpleRequestInit);
-        if (!res.ok) throw new Error(`Snapshot fetch failed ${res.status}`);
+        if (!res.ok) {
+          const digestRes = await this.trySnapshotDigestRetry(addr, headers, username, password, res, controller.signal);
+          if (!digestRes) throw new Error(`Snapshot fetch failed ${res.status}`);
+          const ab = await digestRes.arrayBuffer();
+          return Buffer.from(ab);
+        }
         const ab = await res.arrayBuffer();
         return Buffer.from(ab);
       } catch (err) {

@@ -3,8 +3,18 @@ import debug from 'debug';
 import http from 'http';
 import { CameraConfig, AppConfig } from '../types';
 import { CameraManager } from '../cameras/cameraManager';
-import { findEventTypesInObj } from './pullPoint';
-import { logError, logInfo, logWarn } from '../logger';
+import {
+  buildSoapEnvelope,
+  extractSubscriptionAddressFromResponse,
+  extractSubscriptionTimingFromResponse,
+  fetchWithTimeout,
+  findEventTypesInObj,
+  PULL_REQUEST_TIMEOUT_MS,
+  redactUrl,
+  soapFaultSummary,
+} from './pullPoint';
+import { buildDigestRetryInit, warnDigestOverHttpOnce } from './digestAuth';
+import { logDebug, logError, logInfo, logWarn } from '../logger';
 import {
   selectAuthMethods,
   logAuthCapabilities,
@@ -16,6 +26,16 @@ import {
 
 const log = debug('push');
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@', allowBooleanAttributes: true });
+const PUSH_SUBSCRIPTION_TERMINATION = 'PT24H';
+
+export interface PushSubscriptionResult {
+  ok: boolean;
+  // Subscription address reported by the camera; null when the response omits one
+  // (the keep-alive then renews against the events xaddr).
+  address?: string | null;
+  currentTimeMs?: number | null;
+  terminationTimeMs?: number | null;
+}
 
 export interface ResolvedNotifyConfig {
   listenPort: number;
@@ -158,12 +178,17 @@ export function startPushServer(cfg: AppConfig, manager: CameraManager) {
   return srv;
 }
 
-export async function createPushSubscription(eventsXaddr: string, cfg: CameraConfig, notifyUrl: string) {
+export async function createPushSubscription(
+  eventsXaddr: string,
+  cfg: CameraConfig,
+  notifyUrl: string,
+  requestTimeoutMs = PULL_REQUEST_TIMEOUT_MS,
+): Promise<PushSubscriptionResult> {
   const body = `<?xml version="1.0" encoding="utf-8"?>
   <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
     <s:Body>
       <tev:CreateSubscription xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
-        <tev:InitialTerminationTime>PT24H</tev:InitialTerminationTime>
+        <tev:InitialTerminationTime>${PUSH_SUBSCRIPTION_TERMINATION}</tev:InitialTerminationTime>
         <tev:NotifyTo xmlns:wsa="http://www.w3.org/2005/08/addressing">
           <wsa:EndpointReference>
             <wsa:Address>${notifyUrl}</wsa:Address>
@@ -206,7 +231,14 @@ export async function createPushSubscription(eventsXaddr: string, cfg: CameraCon
     }
 
     const init = { method: 'POST', headers, body };
-    const r = await fetcher(eventsXaddr, init as { method?: string; headers?: Record<string,string>; body?: string });
+    let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
+    try {
+      r = await fetchWithTimeout(fetcher, eventsXaddr, init, requestTimeoutMs);
+    } catch (err) {
+      log('createPushSubscription error', err);
+      logError('[ERROR] CreateSubscription request failed', err);
+      return { ok: false };
+    }
     const txt = await r.text();
     const snippet = txt.slice(0, 200);
     log('createPushSubscription response', snippet);
@@ -215,8 +247,36 @@ export async function createPushSubscription(eventsXaddr: string, cfg: CameraCon
       if (hasCreds) {
         logAuthFailure(cfg.name, 'basic', r.status);
       }
+
+      // Digest retry: some cameras challenge with 401 + WWW-Authenticate: Digest only.
+      const digestInit = buildDigestRetryInit(init, cfg, r.headers['www-authenticate'] ?? '', eventsXaddr);
+      if (digestInit) {
+        warnDigestOverHttpOnce(cfg.name, eventsXaddr);
+        try {
+          const digestResp = await fetchWithTimeout(fetcher, eventsXaddr, digestInit, requestTimeoutMs);
+          const digestTxt = await digestResp.text();
+          if (digestResp.ok && !/<\s*(?:\w+:)?fault\b/i.test(digestTxt)) {
+            if (hasCreds) {
+              logAuthSuccess(cfg.name, 'digest');
+            }
+            log('createPushSubscription digest response', digestTxt.slice(0, 200));
+            const obj = parser.parse(digestTxt);
+            const timing = extractSubscriptionTimingFromResponse(obj, 'CreateSubscriptionResponse');
+            return {
+              ok: true,
+              address: extractSubscriptionAddressFromResponse(obj, eventsXaddr),
+              currentTimeMs: timing.currentTimeMs,
+              terminationTimeMs: timing.terminationTimeMs,
+            };
+          }
+          logDebug(`[DEBUG] CreateSubscription Digest attempt failed camera=${cfg.name} status=${digestResp.status} body=${digestTxt.slice(0, 200)}`);
+        } catch (err) {
+          logDebug(`[DEBUG] CreateSubscription Digest attempt error camera=${cfg.name}`, err);
+        }
+      }
+
       logWarn(`[WARN] CreateSubscription failed status=${r.status} body=${snippet}`);
-      return false;
+      return { ok: false };
     }
 
     if (/<\s*(?:\w+:)?fault\b/i.test(txt)) {
@@ -224,16 +284,143 @@ export async function createPushSubscription(eventsXaddr: string, cfg: CameraCon
         logAuthFailure(cfg.name, 'basic', r.status, 'soap_fault');
       }
       logError(`[ERROR] CreateSubscription returned SOAP Fault status=${r.status} body=${snippet}`);
-      return false;
+      return { ok: false };
     }
 
     if (hasCreds) {
       logAuthSuccess(cfg.name, 'basic');
     }
-    return true;
+
+    let address: string | null = null;
+    let currentTimeMs: number | null = null;
+    let terminationTimeMs: number | null = null;
+    try {
+      const obj = parser.parse(txt);
+      address = extractSubscriptionAddressFromResponse(obj, eventsXaddr);
+      const timing = extractSubscriptionTimingFromResponse(obj, 'CreateSubscriptionResponse');
+      currentTimeMs = timing.currentTimeMs;
+      terminationTimeMs = timing.terminationTimeMs;
+    } catch (err) {
+      logDebug(`[DEBUG] CreateSubscription response parse warning camera=${cfg.name}`, err);
+    }
+
+    return { ok: true, address, currentTimeMs, terminationTimeMs };
   } catch (err) {
     log('createPushSubscription error', err);
     logError('[ERROR] CreateSubscription request failed', err);
-    return false;
+    return { ok: false };
+  }
+}
+
+export async function renewPushSubscription(
+  subAddr: string,
+  cfg: CameraConfig,
+  requestTimeoutMs = PULL_REQUEST_TIMEOUT_MS,
+): Promise<{ currentTimeMs: number | null; terminationTimeMs: number | null } | null> {
+  const bodyInner = `<wsnt:Renew xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
+        <wsnt:TerminationTime>${PUSH_SUBSCRIPTION_TERMINATION}</wsnt:TerminationTime>
+      </wsnt:Renew>`;
+  const action = 'http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewRequest';
+  const headerVariants: Array<{ name: string; headers: Record<string, string> }> = [
+    {
+      name: 'soap12-action-content-type',
+      headers: { 'Content-Type': `application/soap+xml; charset=utf-8; action="${action}"` },
+    },
+    {
+      name: 'soap12-soapaction-header',
+      headers: { 'Content-Type': 'application/soap+xml; charset=utf-8', SOAPAction: action },
+    },
+    {
+      name: 'soap11-soapaction-header',
+      headers: { 'Content-Type': 'text/xml; charset=utf-8', SOAPAction: `"${action}"` },
+    },
+    {
+      name: 'soap12-basic',
+      headers: { 'Content-Type': 'application/soap+xml; charset=utf-8' },
+    },
+  ];
+
+  const auth = basicAuthHeader(cfg);
+  const requestVariants = cfg.username && cfg.password
+    ? [
+        { name: 'wsse', useWsse: true },
+        { name: 'basic', useWsse: false },
+      ]
+    : [
+        { name: 'basic', useWsse: false },
+      ];
+
+  try {
+    const fetcher = (globalThis as unknown as { fetch?: typeof fetch }).fetch;
+    if (!fetcher) throw new Error('Global fetch is not available');
+
+    const attemptFailures: string[] = [];
+
+    for (const variant of headerVariants) {
+      for (const req of requestVariants) {
+        if (req.useWsse && (!cfg.username || !cfg.password)) continue;
+
+        const headers = { ...variant.headers };
+        if (!req.useWsse && auth) {
+          if (/^http:\/\//i.test(subAddr)) {
+            logWarn(`[WARN] Falling back to Basic auth over non-TLS camera=${cfg.name} url=${redactUrl(subAddr)}`);
+          }
+          headers.Authorization = auth;
+        }
+
+        const body = buildSoapEnvelope(bodyInner, cfg, req.useWsse);
+        const init = { method: 'POST', headers, body };
+        const attempt = `${variant.name}/${req.name}`;
+
+        let response: Awaited<ReturnType<typeof fetchWithTimeout>>;
+        try {
+          response = await fetchWithTimeout(fetcher, subAddr, init, requestTimeoutMs);
+        } catch (err) {
+          const msg = `variant=${attempt} fetchError=${(err as Error)?.message || String(err)}`;
+          attemptFailures.push(msg);
+          logDebug(`[DEBUG] RenewPushSubscription request error camera=${cfg.name} url=${redactUrl(subAddr)} ${msg}`);
+          continue;
+        }
+
+        const txt = await response.text();
+        if (!response.ok) {
+          const fault = soapFaultSummary(txt);
+          const msg = `variant=${attempt} status=${response.status} fault=${fault || 'n/a'}`;
+          attemptFailures.push(msg);
+          logDebug(`[DEBUG] RenewPushSubscription attempt failed camera=${cfg.name} url=${redactUrl(subAddr)} ${msg}`);
+          continue;
+        }
+
+        const okFault = soapFaultSummary(txt);
+        if (okFault) {
+          const msg = `variant=${attempt} status=${response.status} fault=${okFault}`;
+          attemptFailures.push(msg);
+          logDebug(`[DEBUG] RenewPushSubscription SOAP fault (retrying) camera=${cfg.name} url=${redactUrl(subAddr)} ${msg}`);
+          continue;
+        }
+
+        const obj = parser.parse(txt);
+        const timing = extractSubscriptionTimingFromResponse(obj, 'RenewResponse');
+        if (timing.terminationTimeMs) {
+          if (attemptFailures.length > 0) {
+            logDebug(`[DEBUG] RenewPushSubscription connected using fallback camera=${cfg.name} finalVariant=${attempt} priorFailures=${attemptFailures.length}`);
+          }
+          return timing;
+        }
+
+        logDebug(`[DEBUG] RenewPushSubscription response missing termination time camera=${cfg.name} variant=${attempt} body=${txt.slice(0, 300)}`);
+        return {
+          currentTimeMs: timing.currentTimeMs,
+          terminationTimeMs: null,
+        };
+      }
+    }
+
+    logWarn(`[WARN] RenewPushSubscription exhausted all fallbacks camera=${cfg.name} url=${redactUrl(subAddr)} failureCount=${attemptFailures.length}`);
+    return null;
+  } catch (err) {
+    logWarn(`[WARN] RenewPushSubscription request failed camera=${cfg.name} url=${redactUrl(subAddr)}`, err);
+    log('renewPushSubscription error', err);
+    return null;
   }
 }

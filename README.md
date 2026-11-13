@@ -67,6 +67,27 @@ mqtt:
 - Base topic key is `mqtt.basetopic` (fallback: `mqtt.baseTopic`).
 - Use password files (`password_file`) instead of plaintext passwords where possible.
 
+#### MQTT broker TLS
+
+```yaml
+mqtt:
+  server: "broker.example"
+  tls:
+    enabled: true
+    caFile: /run/secrets/ca.crt        # optional CA bundle used to verify the broker
+    certFile: /run/secrets/client.crt  # optional client certificate (requires keyFile)
+    keyFile: /run/secrets/client.key   # optional client key (requires certFile)
+    keyPassphraseFile: /run/secrets/key.pass # optional passphrase file for keyFile
+    rejectUnauthorized: true           # default true
+    servername: broker.example         # optional SNI override
+```
+
+- `mqtt.tls.enabled: true` switches the broker connection to `mqtts://` (default port `8883` unless `mqtt.port` is set).
+- `mqtt.url` (full URL override, e.g. `mqtts://user:pass@host:8883`) takes precedence over `server`/`port`/`tls`; it must start with `mqtt://` or `mqtts://`.
+- Certificate files are read when the connection is built; a missing file is a fatal error so the app fails fast instead of silently downgrading to plaintext.
+- On config reload, TLS settings and certificate file contents are part of the MQTT reconnect fingerprint, so rotating a certificate forces a reconnect.
+- Without a `tls` (and `url`) block the connection stays plain `mqtt://` and behavior is unchanged.
+
 ### Logging
 
 ```yaml
@@ -98,6 +119,7 @@ homeassistant:
 - Discovery entities use dual availability topics (`<baseTopic>/<camera>/status` and `<baseTopic>/status`) with `availability_mode: all`.
 - Discovery includes retained camera metadata on `<baseTopic>/<camera>/meta` with camera IP, ONVIF port, and event mode.
 - `homeassistant.components.appReloadCommand` controls the app-level command select entity (enabled by default).
+- Optional `homeassistant.expireAfterSeconds` (non-negative integer, seconds) adds `expire_after` to event binary_sensor discovery payloads only. With it set, a camera that stops publishing becomes unavailable in Home Assistant after the window instead of staying stuck on a retained `ON`. `0`/absent keeps payloads byte-identical to before.
 
 ### Event Snapshot Cooldown
 
@@ -247,6 +269,10 @@ Push mode (optional):
 
 - App hosts a notify endpoint and receives camera POST notifications
 - Optional auto-subscribe can request camera-side CreateSubscription
+- Subscriptions request an initial termination time of 24 hours and are renewed automatically about 30 seconds before expiry (cameras that omit `TerminationTime` are renewed on a fixed 23-hour cadence)
+- Self-healing: if a renewal fails, the app re-creates the subscription automatically (retried with backoff until it succeeds), so camera reboots and expired subscriptions recover without a container restart
+- Camera status goes `OFFLINE` after 3 consecutive subscription failures and back to `ONLINE` on the next successful (re-)subscription
+- Limitation: a camera that simply sends no notifications is not treated as a dead subscription; renewal success is the health probe, and missing notifications never mark the camera offline
 
 Example push config:
 
@@ -279,9 +305,16 @@ Notify path format is `${notify.basePath}/${cameraName}`.
 
 ONVIF request strategy is secure-first:
 
-- Try WS-Security UsernameToken first when credentials exist
-- Fall back to Basic auth only if needed
+1. Try WS-Security UsernameToken first when credentials exist
+2. Basic auth (preemptive, unchanged fast path — no extra round trips when it works)
+3. HTTP Digest: only when the Basic attempt fails with `401` and a `WWW-Authenticate: Digest` challenge, the same request is retried once with a computed Digest header (MD5 or SHA-256)
+
+Additional behavior:
+
 - Warn when falling back to Basic over non-TLS (`http://`)
+- Digest over non-TLS is noted once per camera at info level
+- Per-attempt failures are logged at debug level; the Digest retry never fires when Basic succeeds
+- Digest is supported for snapshot fetches, event discovery, pull polling, pull subscribe/renew, and push subscribe
 
 ## Troubleshooting
 

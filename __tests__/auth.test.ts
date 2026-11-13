@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach } from '@jest/globals';
+import { createHash } from 'crypto';
 import {
   parseDigestChallenge,
   generateDigestAuthHeader,
+  buildDigestRetryInit,
   type DigestChallenge,
 } from '../src/onvif/digestAuth';
 import {
@@ -135,6 +137,92 @@ describe('HTTP Digest Authentication', () => {
       const result1 = generateDigestAuthHeader(cfg, challenge, 'POST', '/service1', '');
       const result2 = generateDigestAuthHeader(cfg, challenge, 'POST', '/service2', '');
       expect(result1.Authorization).not.toEqual(result2.Authorization);
+    });
+
+    it('uses a 32 hex character random cnonce when qop is present', () => {
+      const result = generateDigestAuthHeader(cfg, challenge, 'POST', '/service', '');
+      const cnonce = result.Authorization.match(/cnonce="([0-9a-f]+)"/)?.[1] ?? '';
+      expect(cnonce).toMatch(/^[0-9a-f]{32}$/);
+    });
+  });
+
+  describe('buildDigestRetryInit', () => {
+    const cfg: CameraConfig = {
+      name: 'testcam',
+      host: '192.168.1.100',
+      port: 8080,
+      username: 'admin',
+      password: 'secret',
+    };
+
+    const digestChallenge = 'Digest realm="ONVIF Device", nonce="abc123", qop="auth"';
+
+    it('returns null for a Basic challenge', () => {
+      const init = { method: 'POST', headers: { 'Content-Type': 'application/soap+xml' }, body: '<body/>' };
+      expect(buildDigestRetryInit(init, cfg, 'Basic realm="Test"', 'http://camera/onvif/device_service')).toBeNull();
+    });
+
+    it('returns null for a malformed challenge', () => {
+      const init = { method: 'POST', headers: {}, body: '<body/>' };
+      expect(buildDigestRetryInit(init, cfg, 'Digest nocRealm', 'http://camera/onvif/device_service')).toBeNull();
+    });
+
+    it('returns null when the camera config has no credentials', () => {
+      const init = { method: 'POST', headers: {}, body: '<body/>' };
+      const noCreds = { ...cfg, username: undefined, password: undefined };
+      expect(buildDigestRetryInit(init, noCreds, digestChallenge, 'http://camera/onvif/device_service')).toBeNull();
+    });
+
+    it('builds a correct MD5 + qop=auth Digest authorization and preserves other headers', () => {
+      const init = {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/soap+xml; charset=utf-8',
+          SOAPAction: 'http://www.onvif.org/ver10/device/wsdl/GetCapabilities',
+          Authorization: 'Basic YWRtaW46c2VjcmV0',
+        },
+        body: '<s:Envelope/>',
+      };
+
+      const retry = buildDigestRetryInit(init, cfg, digestChallenge, 'http://camera/onvif/device_service');
+      expect(retry).not.toBeNull();
+      const auth = retry?.headers.Authorization ?? '';
+
+      expect(auth).toContain('Digest username="admin"');
+      expect(auth).toContain('realm="ONVIF Device"');
+      expect(auth).toContain('nonce="abc123"');
+      expect(auth).toContain('uri="/onvif/device_service"');
+      expect(auth).toContain('qop=auth');
+      expect(auth).toContain('nc=00000001');
+
+      // cnonce is 32 hex chars
+      const cnonce = auth.match(/cnonce="([0-9a-f]+)"/)?.[1] ?? '';
+      expect(cnonce).toMatch(/^[0-9a-f]{32}$/);
+
+      // response is the RFC 2617 MD5 computation over the request-target (path)
+      const ha1 = createHash('md5').update('admin:ONVIF Device:secret').digest('hex');
+      const ha2 = createHash('md5').update('POST:/onvif/device_service').digest('hex');
+      const expectedResponse = createHash('md5')
+        .update(`${ha1}:abc123:00000001:${cnonce}:auth:${ha2}`)
+        .digest('hex');
+      expect(auth).toContain(`response="${expectedResponse}"`);
+
+      // request shape preserved, only Authorization replaced
+      expect(retry?.headers['Content-Type']).toBe('application/soap+xml; charset=utf-8');
+      expect(retry?.headers.SOAPAction).toBe('http://www.onvif.org/ver10/device/wsdl/GetCapabilities');
+      expect(retry?.body).toBe('<s:Envelope/>');
+      expect(retry?.method).toBe('POST');
+    });
+
+    it('uses the query string in the digest uri when present', () => {
+      const retry = buildDigestRetryInit(
+        { method: 'GET', headers: {} },
+        cfg,
+        digestChallenge,
+        'http://camera/snapshot.jpg?channel=1',
+      );
+      expect(retry).not.toBeNull();
+      expect(retry?.headers.Authorization).toContain('uri="/snapshot.jpg?channel=1"');
     });
   });
 

@@ -22,6 +22,10 @@ function getHomeAssistantSettings(cfg: AppConfig) {
     enabled: settings.enabled !== false,
     prefix: settings.prefix || 'homeassistant',
     retain: settings.retain !== false,
+    // 0/absent means "omit expire_after" (mirrors config normalization for direct AppConfig use)
+    expireAfterSeconds: typeof settings.expireAfterSeconds === 'number' && settings.expireAfterSeconds > 0
+      ? settings.expireAfterSeconds
+      : undefined,
     components: {
       events: components.events !== false,
       status: components.status !== false, // compatibility no-op
@@ -80,6 +84,7 @@ function buildEventDiscovery(
   baseTopic: string,
   prefix: string,
   retain: boolean,
+  expireAfterSeconds?: number,
 ): DiscoveryEntry[] {
   const device = buildDevice(baseTopic, camera);
   const metadataTopic = `${baseTopic}/${camera.name}/meta`;
@@ -102,6 +107,9 @@ function buildEventDiscovery(
 
     if (eventType === 'motion') payload.device_class = 'motion';
     if (eventType === 'people') payload.device_class = 'occupancy';
+    // expire_after makes a camera that stops publishing become unavailable in HA
+    // instead of staying stuck on a retained ON. Event sensors only.
+    if (expireAfterSeconds) payload.expire_after = expireAfterSeconds;
 
     entries.push({
       topic,
@@ -222,7 +230,7 @@ function buildDiscoveryEntries(cfg: AppConfig): DiscoveryEntry[] {
     }
 
     if (settings.components.events) {
-      entries.push(...buildEventDiscovery(camera, baseTopic, settings.prefix, settings.retain));
+      entries.push(...buildEventDiscovery(camera, baseTopic, settings.prefix, settings.retain, settings.expireAfterSeconds));
     }
     if (settings.components.snapshot) {
       entries.push(buildSnapshotDiscovery(camera, baseTopic, settings.prefix, settings.retain));

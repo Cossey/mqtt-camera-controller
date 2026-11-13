@@ -67,13 +67,16 @@ const SOAP_PULL_MESSAGES_OK = `<?xml version="1.0" encoding="utf-8"?>
   </s:Body>
 </s:Envelope>`;
 
-function mockResponse(ok: boolean, status: number, body: string) {
+function mockResponse(ok: boolean, status: number, body: string, headers: Record<string, string> = {}) {
   return {
     ok,
     status,
     text: async () => body,
+    headers,
   };
 }
+
+const DIGEST_CHALLENGE_HEADERS = { 'WWW-Authenticate': 'Digest realm="IPC", nonce="abc123", qop="auth"' };
 
 function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -645,6 +648,174 @@ describe('PullPoint event parsing', () => {
     } finally {
       (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
       jest.useRealTimers();
+    }
+  });
+
+  test('getEventsXaddr falls back to Digest auth after a Basic 401 Digest challenge', async () => {
+    // wsse (no Authorization header) and Basic attempts are challenged; Digest succeeds.
+    const fetchMock = jest.fn(async (_url: string, init?: { headers?: Record<string, string> }) => {
+      const auth = init?.headers?.Authorization || '';
+      if (auth.startsWith('Digest ')) {
+        return mockResponse(true, 200, SOAP_CAPABILITIES_WITH_EVENTS_XADDR);
+      }
+      return mockResponse(false, 401, 'Unauthorized', DIGEST_CHALLENGE_HEADERS);
+    });
+
+    const originalFetch = (globalThis as unknown as { fetch?: unknown }).fetch;
+    (globalThis as unknown as { fetch?: unknown }).fetch = fetchMock;
+
+    try {
+      const xaddr = await getEventsXaddr({
+        name: 'gate',
+        host: '192.168.50.202',
+        port: 2020,
+        username: 'admin',
+        password: 'pw',
+      });
+
+      expect(xaddr).toBe('http://192.168.50.202:1024/event-1024_1024');
+      // wsse -> basic -> digest: exactly three attempts, no more
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      const digestInit = fetchMock.mock.calls[2][1] as { headers: Record<string, string> };
+      expect(digestInit.headers.Authorization).toContain('Digest username="admin"');
+    } finally {
+      (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
+    }
+  });
+
+  test('pull polling stays healthy using Digest auth when Basic is challenged', async () => {
+    const fetchMock = jest.fn(async (url: string, init?: { body?: string; headers?: Record<string, string> }) => {
+      const auth = init?.headers?.Authorization || '';
+      const body = init?.body || '';
+      if (auth.startsWith('Digest ')) {
+        if (url.endsWith('/onvif/device_service')) return mockResponse(true, 200, SOAP_CAPABILITIES_WITH_EVENTS_XADDR);
+        if (body.includes('CreatePullPointSubscription')) return mockResponse(true, 200, SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS);
+        if (url.endsWith('/sub-1')) return mockResponse(true, 200, SOAP_PULL_MESSAGES_OK);
+      }
+      return mockResponse(false, 401, 'Unauthorized', DIGEST_CHALLENGE_HEADERS);
+    });
+
+    const originalFetch = (globalThis as unknown as { fetch?: unknown }).fetch;
+    (globalThis as unknown as { fetch?: unknown }).fetch = fetchMock;
+    const onHealthy = jest.fn();
+
+    try {
+      const controller = await startPullPoint(
+        {
+          name: 'gate',
+          host: '192.168.50.202',
+          port: 2020,
+          username: 'admin',
+          password: 'pw',
+        },
+        () => undefined,
+        { onHealthy, pollIntervalMs: 50 }
+      );
+
+      await wait(220);
+      controller.stop();
+
+      expect(onHealthy).toHaveBeenCalledTimes(1);
+      const digestCalls = fetchMock.mock.calls.filter(
+        (c) => String((c[1] as { headers?: Record<string, string> })?.headers?.Authorization || '').startsWith('Digest ')
+      );
+      expect(digestCalls.length).toBeGreaterThan(0);
+      // create and poll requests both end up using Digest
+      expect(digestCalls.some((c) => String(c[0]).endsWith('/event-1024_1024'))).toBe(true);
+      expect(digestCalls.some((c) => String(c[0]).endsWith('/sub-1'))).toBe(true);
+    } finally {
+      (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
+    }
+  });
+
+  test('polling makes no Digest attempts when Basic auth succeeds', async () => {
+    const fetchMock = jest.fn(async (url: string, init?: { body?: string; headers?: Record<string, string> }) => {
+      const auth = init?.headers?.Authorization || '';
+      const body = init?.body || '';
+      if (auth.startsWith('Digest ')) {
+        return mockResponse(false, 500, 'digest must not be attempted');
+      }
+      if (auth.startsWith('Basic ')) {
+        if (url.endsWith('/onvif/device_service')) return mockResponse(true, 200, SOAP_CAPABILITIES_WITH_EVENTS_XADDR);
+        if (body.includes('CreatePullPointSubscription')) return mockResponse(true, 200, SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS);
+        return mockResponse(true, 200, SOAP_PULL_MESSAGES_OK);
+      }
+      // wsse attempts are rejected without a Digest challenge
+      return mockResponse(false, 500, 'wsse rejected');
+    });
+
+    const originalFetch = (globalThis as unknown as { fetch?: unknown }).fetch;
+    (globalThis as unknown as { fetch?: unknown }).fetch = fetchMock;
+    const onHealthy = jest.fn();
+
+    try {
+      const controller = await startPullPoint(
+        {
+          name: 'gate',
+          host: '192.168.50.202',
+          port: 2020,
+          username: 'admin',
+          password: 'pw',
+        },
+        () => undefined,
+        { onHealthy, pollIntervalMs: 50 }
+      );
+
+      await wait(220);
+      controller.stop();
+
+      expect(onHealthy).toHaveBeenCalledTimes(1);
+      const digestAttempts = fetchMock.mock.calls.filter(
+        (c) => String((c[1] as { headers?: Record<string, string> })?.headers?.Authorization || '').startsWith('Digest ')
+      );
+      expect(digestAttempts).toHaveLength(0);
+    } finally {
+      (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
+    }
+  });
+
+  test('renews the pull subscription via the final Digest fallback when variants are challenged', async () => {
+    const fetchMock = jest.fn(async (url: string, init?: { body?: string; headers?: Record<string, string> }) => {
+      const auth = init?.headers?.Authorization || '';
+      const body = init?.body || '';
+      if (auth.startsWith('Digest ')) {
+        if (url.endsWith('/onvif/device_service')) return mockResponse(true, 200, SOAP_CAPABILITIES_WITH_EVENTS_XADDR);
+        if (body.includes('CreatePullPointSubscription')) return mockResponse(true, 200, SOAP_CREATE_SUBSCRIPTION_WITH_ADDRESS_AND_TIMING);
+        if (body.includes('<wsnt:Renew')) return mockResponse(true, 200, SOAP_RENEW_RESPONSE);
+        if (url.endsWith('/sub-1')) return mockResponse(true, 200, SOAP_PULL_MESSAGES_OK);
+      }
+      return mockResponse(false, 401, 'Unauthorized', DIGEST_CHALLENGE_HEADERS);
+    });
+
+    const originalFetch = (globalThis as unknown as { fetch?: unknown }).fetch;
+    (globalThis as unknown as { fetch?: unknown }).fetch = fetchMock;
+
+    try {
+      const controller = await startPullPoint(
+        {
+          name: 'gate',
+          host: '192.168.50.202',
+          port: 2020,
+          username: 'admin',
+          password: 'pw',
+        },
+        () => undefined,
+        { pollIntervalMs: 50 }
+      );
+
+      // 2s lifetime -> renew at ~1s; renewal succeeds via the single Digest fallback attempt
+      await wait(1500);
+      controller.stop();
+
+      const digestRenewCalls = fetchMock.mock.calls.filter(
+        (c) => String((c[1] as { headers?: Record<string, string> })?.headers?.Authorization || '').startsWith('Digest ')
+          && String((c[1] as { body?: string })?.body || '').includes('<wsnt:Renew')
+      );
+      expect(digestRenewCalls.length).toBeGreaterThan(0);
+      expect(String(digestRenewCalls[0][0])).toContain('/sub-1');
+      expect((digestRenewCalls[0][1] as { headers: Record<string, string> }).headers.Authorization).toContain('Digest username="admin"');
+    } finally {
+      (globalThis as unknown as { fetch?: unknown }).fetch = originalFetch;
     }
   });
 });

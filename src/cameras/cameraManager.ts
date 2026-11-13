@@ -11,6 +11,7 @@ export class CameraManager {
   cameras: Camera[] = [];
   cfg: AppConfig;
   mqtt: MQTTWrapper;
+  private pushKeepAlives: Array<{ stop: () => void }> = [];
 
   constructor(cfg: AppConfig, mqtt: MQTTWrapper) {
     this.cfg = cfg;
@@ -43,33 +44,31 @@ export class CameraManager {
       // can bail out early; periodic snapshots must not depend on its outcome.
       cam.startPeriodicSnapshotLoop();
 
-      // if push mode and autoSubscribe configured, try to ask camera to POST to our notify endpoint
+      // if push mode and autoSubscribe configured, start the subscription keep-alive.
+      // It establishes the subscription, renews it before expiry, and re-subscribes
+      // (with backoff) after failures so camera reboots recover without a restart.
       try {
         if (camCfg.event?.mode === 'push' && camCfg.event?.push?.autoSubscribe) {
-          const { getEventsXaddr } = await import('../onvif/pullPoint');
-          const { createPushSubscription, buildNotifyUrl } = await import('../onvif/push');
-          const eventsXaddr = await getEventsXaddr(camCfg);
-          if (eventsXaddr) {
-            const notifyUrl = buildNotifyUrl(this.cfg, camCfg.name, camCfg.event?.push?.notifyPath);
-            if (!notifyUrl) {
-              await cam.setEventChannelStatus('offline', 'notify baseUrl missing/invalid for push auto-subscribe');
-              logError(`[ERROR] Missing or invalid notify.baseUrl for push auto-subscribe camera=${camCfg.name}`);
-              continue;
-            }
-            const ok = await createPushSubscription(eventsXaddr, camCfg, notifyUrl);
-            if (ok) {
-              await cam.setEventChannelStatus('online', 'push auto-subscribe ok');
-              logInfo(`[INFO] Push subscription created camera=${camCfg.name} notifyUrl=${notifyUrl}`);
-              log('Push subscription created for', camCfg.name);
-            } else {
-              await cam.setEventChannelStatus('offline', 'push auto-subscribe failed');
-              logError(`[ERROR] Push subscription attempt failed for camera=${camCfg.name}`);
-              log('Push subscription attempt failed for', camCfg.name);
-            }
+          const { buildNotifyUrl } = await import('../onvif/push');
+          const notifyUrl = buildNotifyUrl(this.cfg, camCfg.name, camCfg.event?.push?.notifyPath);
+          if (!notifyUrl) {
+            await cam.setEventChannelStatus('offline', 'notify baseUrl missing/invalid for push auto-subscribe');
+            logError(`[ERROR] Missing or invalid notify.baseUrl for push auto-subscribe camera=${camCfg.name}`);
+            log('Could not determine notify URL for push subscription', camCfg.name);
           } else {
-            await cam.setEventChannelStatus('offline', 'events xaddr discovery failed for push auto-subscribe');
-            logError(`[ERROR] Could not determine events XAddr for push subscription camera=${camCfg.name}`);
-            log('Could not determine events XAddr for push subscription', camCfg.name);
+            const { startPushSubscriptionKeepAlive } = await import('../onvif/pushSubscriptionKeepAlive');
+            const keepAlive = startPushSubscriptionKeepAlive(camCfg, notifyUrl, {
+              onHealthy: () => {
+                void cam.setEventChannelStatus('online', 'push subscription healthy');
+              },
+              onError: (err: unknown) => {
+                logError(`[ERROR] Push subscription attempt failed for camera=${camCfg.name}`, err);
+                log('Push subscription attempt failed for', camCfg.name, err);
+                void cam.setEventChannelStatus('offline', 'push subscription unhealthy');
+              },
+            });
+            this.pushKeepAlives.push(keepAlive);
+            log('Push subscription keep-alive started for', camCfg.name);
           }
         }
       } catch (err) {
@@ -86,6 +85,11 @@ export class CameraManager {
   }
 
   async stop() {
+    for (const keepAlive of this.pushKeepAlives) {
+      keepAlive.stop();
+    }
+    this.pushKeepAlives = [];
+
     for (const camera of this.cameras) {
       await camera.stop();
     }

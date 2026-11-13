@@ -11,7 +11,17 @@ mqtt:
   password_file: /run/secrets/mqtt_password
   # you may set the password directly (not recommended):
   # password: "your-password"
-  # url: optional if you prefer to set the full URL directly (e.g. mqtt://user:pass@host:1883)
+  # url: optional if you prefer to set the full URL directly (e.g. mqtt://user:pass@host:1883
+  # or mqtts://user:pass@host:8883); it takes precedence over server/port/tls
+  # TLS for the broker connection (mqtts://); all keys optional:
+  # tls:
+  #   enabled: true
+  #   caFile: /run/secrets/ca.crt              # optional CA bundle used to verify the broker
+  #   certFile: /run/secrets/client.crt        # optional client certificate (requires keyFile)
+  #   keyFile: /run/secrets/client.key         # optional client key (requires certFile)
+  #   keyPassphraseFile: /run/secrets/key.pass # optional passphrase file for keyFile
+  #   rejectUnauthorized: true                 # default true
+  #   servername: broker.example               # optional SNI override
 
 # Cameras can be specified in two supported ways:
 # If a camera omits the snapshot section entirely, periodic and on-event snapshots are disabled.
@@ -112,6 +122,10 @@ homeassistant:
   enabled: true
   prefix: "homeassistant"
   retain: true
+  # optional: adds expire_after (seconds) to event binary_sensor discovery payloads so a
+  # camera that stops publishing becomes unavailable in Home Assistant after the window
+  # instead of staying stuck on a retained ON. 0/absent = disabled.
+  # expireAfterSeconds: 3600
   components:
     events: true
     snapshot: true

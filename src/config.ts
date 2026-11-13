@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import YAML from 'yaml';
-import { AppConfig, CameraConfig, RawCameraEntry, MqttConfig, SnapshotConfig, LogLevelName, HomeAssistantConfig, RateLimitConfig } from './types';
+import { AppConfig, CameraConfig, RawCameraEntry, MqttConfig, MqttTlsConfig, SnapshotConfig, LogLevelName, HomeAssistantConfig, RateLimitConfig } from './types';
 
 const VALID_SNAPSHOT_EVENT_TYPES = ['motion', 'line', 'people', 'vehicle', 'animal', 'all'] as const;
 export const DEFAULT_SNAPSHOT_TIMEOUT_MS = 15000;
@@ -41,6 +41,12 @@ function normalizeHomeAssistant(raw: unknown): HomeAssistantConfig {
   if (h.components !== undefined && typeof h.components !== 'object') {
     throw new Error('homeassistant.components must be an object');
   }
+  if (h.expireAfterSeconds !== undefined) {
+    const expire = h.expireAfterSeconds;
+    if (typeof expire !== 'number' || !Number.isInteger(expire) || expire < 0) {
+      throw new Error('homeassistant.expireAfterSeconds must be a non-negative integer (seconds)');
+    }
+  }
   const components = h.components && typeof h.components === 'object'
     ? (h.components as Record<string, unknown>)
     : {};
@@ -49,6 +55,10 @@ function normalizeHomeAssistant(raw: unknown): HomeAssistantConfig {
     enabled: normalizeBoolean(h.enabled, true, 'homeassistant.enabled'),
     prefix: typeof h.prefix === 'string' ? h.prefix : 'homeassistant',
     retain: normalizeBoolean(h.retain, true, 'homeassistant.retain'),
+    // 0 or absent means "omit expire_after"; only a positive integer is kept.
+    expireAfterSeconds: typeof h.expireAfterSeconds === 'number' && h.expireAfterSeconds > 0
+      ? h.expireAfterSeconds
+      : undefined,
     components: {
       events: normalizeBoolean(components.events, true, 'homeassistant.components.events'),
       status: normalizeBoolean(components.status, true, 'homeassistant.components.status'),
@@ -70,6 +80,13 @@ function validateHomeAssistantConfiguration(homeAssistant: HomeAssistantConfig) 
 
   if (typeof homeAssistant.prefix !== 'string' || homeAssistant.prefix.trim().length === 0) {
     throw new Error('homeassistant.prefix must be a non-empty string');
+  }
+
+  if (homeAssistant.expireAfterSeconds !== undefined) {
+    const expire = homeAssistant.expireAfterSeconds;
+    if (typeof expire !== 'number' || !Number.isInteger(expire) || expire < 0) {
+      throw new Error('homeassistant.expireAfterSeconds must be a non-negative integer (seconds)');
+    }
   }
 
   const components = homeAssistant.components;
@@ -195,6 +212,49 @@ function validateCameraOnvifConnectivity(cameras: CameraConfig[]) {
   }
 }
 
+function normalizeMqttTls(raw: unknown): MqttTlsConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('mqtt.tls must be an object');
+  }
+
+  const t = raw as Record<string, unknown>;
+  const tls: MqttTlsConfig = {};
+
+  if (t.enabled !== undefined) {
+    if (typeof t.enabled !== 'boolean') throw new Error('mqtt.tls.enabled must be a boolean');
+    tls.enabled = t.enabled;
+  }
+
+  const fileFields = ['caFile', 'certFile', 'keyFile', 'keyPassphraseFile'] as const;
+  for (const field of fileFields) {
+    const value = t[field];
+    if (value === undefined) continue;
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      throw new Error(`mqtt.tls.${field} must be a non-empty string`);
+    }
+    tls[field] = value;
+  }
+
+  if (t.rejectUnauthorized !== undefined) {
+    if (typeof t.rejectUnauthorized !== 'boolean') throw new Error('mqtt.tls.rejectUnauthorized must be a boolean');
+    tls.rejectUnauthorized = t.rejectUnauthorized;
+  }
+
+  if (t.servername !== undefined) {
+    if (typeof t.servername !== 'string' || t.servername.trim().length === 0) {
+      throw new Error('mqtt.tls.servername must be a non-empty string');
+    }
+    tls.servername = t.servername;
+  }
+
+  if ((tls.certFile !== undefined) !== (tls.keyFile !== undefined)) {
+    throw new Error('mqtt.tls requires both certFile and keyFile');
+  }
+
+  return Object.keys(tls).length > 0 ? tls : undefined;
+}
+
 function normalizeMqtt(raw: unknown): MqttConfig {
   const mqtt: MqttConfig = {};
   if (!raw || typeof raw !== 'object') return mqtt;
@@ -206,6 +266,12 @@ function normalizeMqtt(raw: unknown): MqttConfig {
   mqtt.username = r.username as string | undefined;
   mqtt.password = r.password as string | undefined;
   mqtt.password_file = r.password_file as string | undefined;
+  // full broker URL override (mqtt:// or mqtts://); takes precedence over server/port/tls
+  mqtt.url = (r.url as string) || undefined;
+  if (mqtt.url !== undefined && !/^mqtts?:\/\//.test(mqtt.url)) {
+    throw new Error('mqtt.url must start with mqtt:// or mqtts://');
+  }
+  mqtt.tls = normalizeMqttTls(r.tls);
   // support password_file for MQTT (Docker secrets)
   if (!mqtt.password && mqtt.password_file) {
     try {

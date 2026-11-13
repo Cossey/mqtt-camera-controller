@@ -191,4 +191,87 @@ describe('Home Assistant discovery', () => {
     );
     expect(mqtt.publishRaw).toHaveBeenCalledWith('mqttai/frontdoor/meta', '', { retain: true });
   });
+
+  test('adds expire_after only to event binary_sensor payloads when configured', async () => {
+    const mqtt = {
+      baseTopic: 'mqttai',
+      publishRaw: jest.fn(),
+    } as any;
+
+    const cfg: AppConfig = {
+      mqtt: { basetopic: 'mqttai' },
+      cameras: [{ name: 'frontdoor' } as any],
+      homeassistant: {
+        enabled: true,
+        expireAfterSeconds: 3600,
+      },
+    };
+
+    await publishHomeAssistantDiscovery(cfg, mqtt);
+
+    const motionCall = mqtt.publishRaw.mock.calls.find((args: unknown[]) =>
+      String(args[0]).includes('homeassistant/binary_sensor/frontdoor_motion/config'),
+    );
+    expect(motionCall).toBeDefined();
+    const motionPayload = JSON.parse(String((motionCall as unknown[])[1]));
+    expect(motionPayload.expire_after).toBe(3600);
+
+    // all five event sensors carry it
+    const eventCalls = mqtt.publishRaw.mock.calls.filter((args: unknown[]) =>
+      String(args[0]).includes('homeassistant/binary_sensor/'),
+    );
+    expect(eventCalls).toHaveLength(5);
+    for (const call of eventCalls) {
+      const payload = JSON.parse(String((call as unknown[])[1]));
+      expect(payload.expire_after).toBe(3600);
+    }
+
+    // snapshot camera and command select payloads are untouched
+    const snapshotCall = mqtt.publishRaw.mock.calls.find((args: unknown[]) =>
+      String(args[0]).includes('homeassistant/camera/frontdoor_snapshot/config'),
+    );
+    const snapshotPayload = JSON.parse(String((snapshotCall as unknown[])[1]));
+    expect(snapshotPayload.expire_after).toBeUndefined();
+
+    const commandCall = mqtt.publishRaw.mock.calls.find((args: unknown[]) =>
+      String(args[0]).includes('homeassistant/select/frontdoor_command/config'),
+    );
+    const commandPayload = JSON.parse(String((commandCall as unknown[])[1]));
+    expect(commandPayload.expire_after).toBeUndefined();
+  });
+
+  test('omits expire_after from event payloads when not configured', async () => {
+    const mqtt = {
+      baseTopic: 'mqttai',
+      publishRaw: jest.fn(),
+    } as any;
+
+    const cfg: AppConfig = {
+      mqtt: { basetopic: 'mqttai' },
+      cameras: [{ name: 'frontdoor' } as any],
+      homeassistant: { enabled: true },
+    };
+
+    await publishHomeAssistantDiscovery(cfg, mqtt);
+
+    const motionCall = mqtt.publishRaw.mock.calls.find((args: unknown[]) =>
+      String(args[0]).includes('homeassistant/binary_sensor/frontdoor_motion/config'),
+    );
+    const motionPayloadStr = String((motionCall as unknown[])[1]);
+    expect(motionPayloadStr).not.toContain('expire_after');
+
+    const motionPayload = JSON.parse(motionPayloadStr);
+    expect(Object.keys(motionPayload)).toEqual([
+      'name',
+      'unique_id',
+      'state_topic',
+      'payload_on',
+      'payload_off',
+      'availability',
+      'availability_mode',
+      'json_attributes_topic',
+      'device',
+      'device_class',
+    ]);
+  });
 });

@@ -1,9 +1,10 @@
 import debug from 'debug';
 import fs from 'fs';
 import http from 'http';
+import { createHash } from 'crypto';
 import { spawnSync } from 'child_process';
 import { loadConfig, resolveConfigPath } from './config';
-import { MQTTWrapper } from './mqttClient';
+import { buildBrokerUrl, buildClientOptions, MQTTWrapper } from './mqttClient';
 import { CameraManager } from './cameras/cameraManager';
 import { AppConfig } from './types';
 import { setLogLevel, logInfo, logWarn, logError, logDebug } from './logger';
@@ -29,38 +30,54 @@ interface RuntimeState {
 }
 
 function buildMqttOptions(cfg: AppConfig) {
-  const mqttOpts: { username?: string; password?: string; will?: { topic: string; payload: string; retain: boolean; qos: 0 | 1 | 2 } } = {};
-  if (cfg.mqtt.username) {
-    mqttOpts.username = cfg.mqtt.username;
-    mqttOpts.password = cfg.mqtt.password;
-  }
-
-  const baseTopic = cfg.mqtt.basetopic || cfg.mqtt.baseTopic || 'onvif2mqtt';
-  mqttOpts.will = {
-    topic: `${baseTopic}/status`,
-    payload: 'OFFLINE',
-    retain: true,
-    qos: 1,
+  // Thin wrapper over the shared mqttClient builders so connection handling
+  // (credentials, will, TLS material) lives in one place.
+  return {
+    mqttOpts: buildClientOptions(cfg.mqtt),
+    baseTopic: cfg.mqtt.basetopic || cfg.mqtt.baseTopic || 'onvif2mqtt',
   };
-
-  return { mqttOpts, baseTopic };
 }
 
 function createMqttClient(cfg: AppConfig): MQTTWrapper {
   const { mqttOpts, baseTopic } = buildMqttOptions(cfg);
-  const brokerHost = cfg.mqtt.server || 'localhost';
-  const brokerPort = cfg.mqtt.port || 1883;
-  const brokerUrl = `mqtt://${brokerHost}${brokerPort ? ':' + brokerPort : ''}`;
-  return new MQTTWrapper(brokerUrl, mqttOpts, baseTopic);
+  return new MQTTWrapper(buildBrokerUrl(cfg.mqtt), mqttOpts, baseTopic);
+}
+
+function readFingerprintFileHash(path?: string): string | null {
+  if (!path) return null;
+  try {
+    return createHash('sha256').update(fs.readFileSync(path)).digest('hex');
+  } catch (err) {
+    // Unreadable files fail fast when the client options are built; keep the
+    // fingerprint total (null) so a later fix still reconnects.
+    logDebug(`[DEBUG] mqttFingerprint could not read file path=${path}`, err);
+    return null;
+  }
 }
 
 function mqttFingerprint(cfg: AppConfig): string {
   const baseTopic = cfg.mqtt.basetopic || cfg.mqtt.baseTopic || 'onvif2mqtt';
-  const brokerHost = cfg.mqtt.server || 'localhost';
-  const brokerPort = cfg.mqtt.port || 1883;
+  const brokerUrl = buildBrokerUrl(cfg.mqtt);
   const username = cfg.mqtt.username || '';
   const password = cfg.mqtt.password || '';
-  return JSON.stringify({ brokerHost, brokerPort, baseTopic, username, password });
+  // TLS settings and certificate file contents are part of the fingerprint so
+  // rotating a cert forces an MQTT reconnect on reload.
+  const tls = cfg.mqtt.tls
+    ? {
+        enabled: cfg.mqtt.tls.enabled ?? false,
+        rejectUnauthorized: cfg.mqtt.tls.rejectUnauthorized ?? true,
+        servername: cfg.mqtt.tls.servername ?? null,
+        caFile: cfg.mqtt.tls.caFile ?? null,
+        certFile: cfg.mqtt.tls.certFile ?? null,
+        keyFile: cfg.mqtt.tls.keyFile ?? null,
+        keyPassphraseFile: cfg.mqtt.tls.keyPassphraseFile ?? null,
+        ca: readFingerprintFileHash(cfg.mqtt.tls.caFile),
+        cert: readFingerprintFileHash(cfg.mqtt.tls.certFile),
+        key: readFingerprintFileHash(cfg.mqtt.tls.keyFile),
+        passphrase: readFingerprintFileHash(cfg.mqtt.tls.keyPassphraseFile),
+      }
+    : null;
+  return JSON.stringify({ brokerUrl, baseTopic, username, password, tls });
 }
 
 async function closePushServer(server: http.Server | null) {

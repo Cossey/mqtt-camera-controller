@@ -1,3 +1,17 @@
+export interface MqttTlsConfig {
+  enabled?: boolean;
+  // optional CA bundle used to verify the broker certificate
+  caFile?: string;
+  // optional client certificate/key pair for mTLS; must be set together
+  certFile?: string;
+  keyFile?: string;
+  // optional file containing the passphrase for keyFile
+  keyPassphraseFile?: string;
+  rejectUnauthorized?: boolean;
+  // optional SNI/server name override
+  servername?: string;
+}
+
 export interface MqttConfig {
   // mqtt-ai-tool style
   server?: string; // host
@@ -10,6 +24,12 @@ export interface MqttConfig {
   password?: string;
   password_file?: string;
   baseTopic?: string; // keep older key supported
+
+  // full broker URL override (e.g. mqtt://user:pass@host:1883 or mqtts://host:8883);
+  // takes precedence over server/port/tls
+  url?: string;
+  // TLS options for the broker connection (mqtts://); used when tls.enabled is true
+  tls?: MqttTlsConfig;
 }
 
 export interface ChannelConfig {
@@ -99,6 +119,10 @@ export interface HomeAssistantConfig {
   enabled?: boolean;
   prefix?: string;
   retain?: boolean;
+  // optional: adds `expire_after` (seconds) to event binary_sensor discovery payloads so a
+  // camera that stops publishing becomes unavailable in Home Assistant after the window.
+  // 0 or absent = omit (payload unchanged).
+  expireAfterSeconds?: number;
   components?: {
     events?: boolean;
     // Deprecated compatibility toggle; status is no longer a standalone discovery entity.

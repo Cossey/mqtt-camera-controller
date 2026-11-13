@@ -1,10 +1,38 @@
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { CameraConfig } from '../types';
+import { logInfo } from '../logger';
 
 /**
  * HTTP Digest Authentication (RFC 2617/7616)
  * Parses WWW-Authenticate: Digest challenges and computes Authorization responses.
  */
+
+const digestOverHttpWarnedCameras = new Set<string>();
+
+function redactUrlForLog(raw: string): string {
+  try {
+    const u = new URL(raw);
+    if (u.username || u.password) {
+      u.username = '***';
+      u.password = '***';
+    }
+    return u.toString();
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * Digest hashes credentials instead of sending them, but using it over plain HTTP
+ * still exposes the challenge/response to observers. Note it once per camera at
+ * info level so frequent poll paths do not spam the log.
+ */
+export function warnDigestOverHttpOnce(cameraName: string, url: string): void {
+  if (!/^http:\/\//i.test(url)) return;
+  if (digestOverHttpWarnedCameras.has(cameraName)) return;
+  digestOverHttpWarnedCameras.add(cameraName);
+  logInfo(`[INFO] Digest auth in use over non-TLS camera=${cameraName} url=${redactUrlForLog(url)}`);
+}
 
 export interface DigestChallenge {
   realm: string;
@@ -104,7 +132,7 @@ export function generateDigestAuthHeader(
 
   if (qop) {
     // MD5-sess is not widely supported by cameras, so we skip that variant
-    const cnonce = createHash('md5').update(Math.random().toString()).digest('hex');
+    const cnonce = randomBytes(16).toString('hex');
     const nc = '00000001';
 
     // response = H(ha1:nonce:nc:cnonce:qop:ha2)
@@ -170,4 +198,47 @@ export async function fetchWithDigestAuth(
 
   // If not 401 or no Digest challenge, return original response
   return firstResp as { ok: boolean; status: number; text: () => Promise<string> };
+}
+
+export interface DigestRetryInit {
+  method?: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+/**
+ * Build a retry init for a request that was rejected with a Digest challenge.
+ * Returns null when the WWW-Authenticate header is not a usable Digest challenge or
+ * the camera config has no credentials. Preserves all other headers (Content-Type,
+ * SOAPAction, ...) and only replaces Authorization, so callers can re-issue the
+ * identical request with a computed Digest header.
+ */
+export function buildDigestRetryInit(
+  init: DigestRetryInit,
+  cfg: CameraConfig,
+  wwwAuthenticate: string,
+  url: string,
+): DigestRetryInit | null {
+  if (!cfg.username || !cfg.password) return null;
+
+  const challenge = parseDigestChallenge(wwwAuthenticate);
+  if (!challenge) return null;
+
+  const method = init.method || 'GET';
+  // Digest signs the request-target the camera receives (path + query), not the absolute URL.
+  let uri = url;
+  try {
+    const parsed = new URL(url);
+    uri = `${parsed.pathname}${parsed.search}`;
+  } catch {
+    // keep the raw url when parsing fails
+  }
+
+  const digest = generateDigestAuthHeader(cfg, challenge, method, uri, init.body);
+
+  return {
+    method: init.method,
+    headers: { ...init.headers, Authorization: digest.Authorization },
+    body: init.body,
+  };
 }

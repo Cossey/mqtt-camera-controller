@@ -926,6 +926,139 @@ describe('Camera stream snapshot credentials', () => {
   });
 });
 
+describe('Camera snapshot HTTP Digest auth', () => {
+  afterEach(() => {
+    delete (globalThis as unknown as { fetch?: unknown }).fetch;
+  });
+
+  test('getSnapshot retries with Digest auth after a 401 Digest challenge', async () => {
+    const mqtt = { publish: jest.fn(), subscribe: jest.fn() } as any;
+    const cam = new Camera({
+      name: 'frontdoor',
+      snapshot: {
+        address: 'http://192.168.1.10/snap.jpg',
+        username: 'admin',
+        password: 'pw',
+      },
+    }, mqtt);
+
+    const calls: Array<{ url: string; auth: string }> = [];
+    (globalThis as unknown as { fetch?: unknown }).fetch = (async (url: string, init?: { headers?: Record<string, string> }) => {
+      const auth = init?.headers?.Authorization || '';
+      calls.push({ url, auth });
+      if (!auth.startsWith('Digest ')) {
+        return {
+          ok: false,
+          status: 401,
+          headers: { get: (name: string) => (name.toLowerCase() === 'www-authenticate' ? 'Digest realm="IPC", nonce="abc123", qop="auth"' : null) },
+        };
+      }
+      return { ok: true, status: 200, arrayBuffer: async () => new TextEncoder().encode('image').buffer };
+    }) as unknown as typeof fetch;
+
+    const snap = await cam.getSnapshot();
+    expect(snap.toString()).toBe('image');
+    expect(calls).toHaveLength(2);
+    expect(calls[0].auth).toContain('Basic ');
+    expect(calls[1].auth).toContain('Digest username="admin"');
+
+    await cam.publishSnapshot(snap);
+    expect(mqtt.publish).toHaveBeenCalledWith('frontdoor/image', snap);
+  });
+
+  test('getSnapshot throws the original error when the Digest retry also fails', async () => {
+    const mqtt = { publish: jest.fn(), subscribe: jest.fn() } as any;
+    const cam = new Camera({
+      name: 'frontdoor',
+      snapshot: {
+        address: 'http://192.168.1.10/snap.jpg',
+        username: 'admin',
+        password: 'pw',
+      },
+    }, mqtt);
+
+    (globalThis as unknown as { fetch?: unknown }).fetch = (async (_url: string, init?: { headers?: Record<string, string> }) => {
+      const auth = init?.headers?.Authorization || '';
+      if (!auth.startsWith('Digest ')) {
+        return {
+          ok: false,
+          status: 401,
+          headers: { get: (name: string) => (name.toLowerCase() === 'www-authenticate' ? 'Digest realm="IPC", nonce="abc123"' : null) },
+        };
+      }
+      return { ok: false, status: 401, headers: { get: () => null } };
+    }) as unknown as typeof fetch;
+
+    await expect(cam.getSnapshot()).rejects.toThrow('Snapshot fetch failed 401');
+  });
+
+  test('getSnapshot does not retry when the camera accepts Basic auth', async () => {
+    const mqtt = { publish: jest.fn(), subscribe: jest.fn() } as any;
+    const cam = new Camera({
+      name: 'frontdoor',
+      snapshot: {
+        address: 'http://192.168.1.10/snap.jpg',
+        username: 'admin',
+        password: 'pw',
+      },
+    }, mqtt);
+
+    const calls: Array<{ auth: string }> = [];
+    (globalThis as unknown as { fetch?: unknown }).fetch = (async (_url: string, init?: { headers?: Record<string, string> }) => {
+      calls.push({ auth: init?.headers?.Authorization || '' });
+      return { ok: true, status: 200, arrayBuffer: async () => new TextEncoder().encode('image').buffer };
+    }) as unknown as typeof fetch;
+
+    const snap = await cam.getSnapshot();
+    expect(snap.toString()).toBe('image');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].auth).toContain('Basic ');
+  });
+});
+
+describe('CameraManager push subscription keep-alive', () => {
+  afterEach(() => {
+    delete (globalThis as unknown as { fetch?: unknown }).fetch;
+  });
+
+  test('starts a keep-alive for push autoSubscribe cameras and cancels it on stop', async () => {
+    const mqtt = {
+      publish: jest.fn(),
+      subscribe: jest.fn(),
+    } as any;
+
+    // camera unreachable: the keep-alive retries in the background until stopped
+    (globalThis as unknown as { fetch?: unknown }).fetch = jest.fn(async () => {
+      throw new Error('connect EHOSTUNREACH 192.168.1.20:80');
+    });
+
+    const manager = new CameraManager({
+      mqtt: { server: 'example.com' },
+      notify: { baseUrl: 'http://192.168.1.5:8080' },
+      cameras: [
+        {
+          name: 'driveway',
+          host: '192.168.1.20',
+          port: 80,
+          event: { mode: 'push', push: { autoSubscribe: true } },
+        },
+      ],
+    } as any, mqtt);
+
+    try {
+      await manager.init();
+      expect(manager.cameras).toHaveLength(1);
+
+      // camera status was flipped online by push init before the keep-alive reports
+      expect(mqtt.publish).toHaveBeenCalledWith('driveway/status', 'ONLINE', { retain: true });
+    } finally {
+      // stop() must cancel the keep-alive (no stray requests, no hanging timers)
+      await manager.stop();
+      expect((manager as unknown as { pushKeepAlives: unknown[] }).pushKeepAlives).toHaveLength(0);
+    }
+  });
+});
+
 describe('CameraManager startup baselines', () => {
   test('publishes retained OFF baseline topics at startup', async () => {
     const mqtt = {

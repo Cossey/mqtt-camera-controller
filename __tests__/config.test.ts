@@ -198,4 +198,78 @@ describe('Config loader normalization', () => {
     const p = writeTempYaml(yaml);
     expect(() => loadConfig(p)).toThrow('homeassistant.components.appReloadCommand must be a boolean');
   });
+
+  test('loads mqtt.tls settings', () => {
+    const yaml = `mqtt:\n  server: example.com\n  tls:\n    enabled: true\n    caFile: /run/secrets/ca.crt\n    certFile: /run/secrets/client.crt\n    keyFile: /run/secrets/client.key\n    keyPassphraseFile: /run/secrets/key.pass\n    rejectUnauthorized: false\n    servername: broker.example\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
+    const p = writeTempYaml(yaml);
+    const cfg = loadConfig(p);
+    expect(cfg.mqtt.tls).toEqual({
+      enabled: true,
+      caFile: '/run/secrets/ca.crt',
+      certFile: '/run/secrets/client.crt',
+      keyFile: '/run/secrets/client.key',
+      keyPassphraseFile: '/run/secrets/key.pass',
+      rejectUnauthorized: false,
+      servername: 'broker.example',
+    });
+  });
+
+  test('omits mqtt.tls when absent', () => {
+    const yaml = `mqtt:\n  server: example.com\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
+    const p = writeTempYaml(yaml);
+    const cfg = loadConfig(p);
+    expect(cfg.mqtt.tls).toBeUndefined();
+    expect(cfg.mqtt.url).toBeUndefined();
+  });
+
+  test('throws when mqtt.tls sets only one of certFile/keyFile', () => {
+    const yaml = `mqtt:\n  server: example.com\n  tls:\n    enabled: true\n    certFile: /run/secrets/client.crt\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
+    const p = writeTempYaml(yaml);
+    expect(() => loadConfig(p)).toThrow('mqtt.tls requires both certFile and keyFile');
+  });
+
+  test('throws when mqtt.tls is not an object', () => {
+    const yaml = `mqtt:\n  server: example.com\n  tls: true\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
+    const p = writeTempYaml(yaml);
+    expect(() => loadConfig(p)).toThrow('mqtt.tls must be an object');
+  });
+
+  test('throws when mqtt.url has an unsupported scheme', () => {
+    const yaml = `mqtt:\n  url: http://example.com:1883\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
+    const p = writeTempYaml(yaml);
+    expect(() => loadConfig(p)).toThrow('mqtt.url must start with mqtt:// or mqtts://');
+  });
+
+  test('loads an mqtts:// mqtt.url override', () => {
+    const yaml = `mqtt:\n  url: mqtts://user:pass@broker.example:8883\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
+    const p = writeTempYaml(yaml);
+    const cfg = loadConfig(p);
+    expect(cfg.mqtt.url).toBe('mqtts://user:pass@broker.example:8883');
+  });
+
+  test('loads homeassistant.expireAfterSeconds when set', () => {
+    const yaml = `mqtt:\n  server: example.com\n\nhomeassistant:\n  expireAfterSeconds: 3600\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
+    const p = writeTempYaml(yaml);
+    const cfg = loadConfig(p);
+    expect(cfg.homeassistant?.expireAfterSeconds).toBe(3600);
+  });
+
+  test('treats homeassistant.expireAfterSeconds 0 as unset', () => {
+    const yaml = `mqtt:\n  server: example.com\n\nhomeassistant:\n  expireAfterSeconds: 0\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
+    const p = writeTempYaml(yaml);
+    const cfg = loadConfig(p);
+    expect(cfg.homeassistant?.expireAfterSeconds).toBeUndefined();
+  });
+
+  test('throws for invalid homeassistant.expireAfterSeconds', () => {
+    const yaml = `mqtt:\n  server: example.com\n\nhomeassistant:\n  expireAfterSeconds: -5\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
+    const p = writeTempYaml(yaml);
+    expect(() => loadConfig(p)).toThrow('homeassistant.expireAfterSeconds must be a non-negative integer (seconds)');
+  });
+
+  test('throws for non-integer homeassistant.expireAfterSeconds', () => {
+    const yaml = `mqtt:\n  server: example.com\n\nhomeassistant:\n  expireAfterSeconds: 1.5\n\ncameras:\n  front-door:\n    host: 192.168.1.10\n    port: 80\n`;
+    const p = writeTempYaml(yaml);
+    expect(() => loadConfig(p)).toThrow('homeassistant.expireAfterSeconds must be a non-negative integer (seconds)');
+  });
 });
